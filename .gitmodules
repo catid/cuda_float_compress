@@ -1,0 +1,3 @@
+[submodule "cuSZp"]
+	path = cuSZp
+	url = https://github.com/szcompressor/cuSZp.git
