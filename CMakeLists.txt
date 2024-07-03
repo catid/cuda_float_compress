@@ -27,7 +27,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Dependencies
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-find_package(Python3 3.10 COMPONENTS Interpreter Development NumPy)
+find_package(Python3 3.7 COMPONENTS Interpreter Development NumPy)
 
 # Link to Torch
 if(NOT TARGET torch_library)
