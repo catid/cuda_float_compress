@@ -15,7 +15,8 @@ class BuildPackage(build_ext):
             self.build_extension(ext)
 
     def build_extension(self, ext):
-        cfg = 'Debug' if self.debug else 'Release'
+        # FIXME: Release mode fails with an error: undefined symbol: fatbinData
+        cfg = 'Debug' if self.debug else 'RelWithDebInfo'
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
         script_dir = os.path.dirname(os.path.abspath(__file__))
 
