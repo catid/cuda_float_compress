@@ -13,7 +13,7 @@ cd cuda_float_compress
 
 conda create -n cfc python=3.10 -y && conda activate cfc
 
-pip install -e .
+pip install .
 ```
 
 
