@@ -2,73 +2,26 @@
 
 #include <stdio.h>
 
-__device__ inline int quantization_f32(float data, float recipPrecision)
+__device__ inline int get_bit_num(uint32_t x)
 {
-    float dataRecip = data*recipPrecision;
-    int s = dataRecip>=-0.5f?0:1;
-    return (int)(dataRecip+0.5f) - s;
+    return (sizeof(uint32_t)*8) - __clz(x);
 }
 
-__device__ inline int get_bit_num(unsigned int x)
-{
-    return (sizeof(unsigned int)*8) - __clz(x);
-}
-
-__global__ void SZplus_compress_kernel_f32(
-    const float* const __restrict__ oriData,
-    unsigned char* const __restrict__ cmpData,
-    volatile unsigned int* const __restrict__ cmpOffset,
+__device__ uint32_t sync_offsets(
+    uint32_t thread_ofs,
+    volatile uint32_t* const __restrict__ cmpOffset,
     volatile int* const __restrict__ flag,
-    const float eb,
-    const size_t nbEle)
+    const size_t nbEle
+)
 {
-    __shared__ unsigned int base_idx;
+    __shared__ uint32_t base_idx;
 
     const int tid = threadIdx.x;
     const int idx = blockIdx.x * blockDim.x + tid;
     const int lane = idx & 31;
     const int warp = idx >> 5;
-    const int block_num = cmp_chunk_f32/32;
-    const int start_idx = idx * cmp_chunk_f32;
-    const int start_block_idx = start_idx/32;
     const int rate_ofs = (nbEle+31)/32;
-    const float recipPrecision = 0.5f/eb;
 
-    int temp_start_idx, temp_end_idx;
-    int quant_chunk_idx;
-    int block_idx;
-    int currQuant, lorenQuant, prevQuant, maxQuant;
-    int absQuant[cmp_chunk_f32];
-    unsigned int sign_flag[block_num];
-    int sign_ofs;
-    int fixed_rate[block_num];
-    unsigned int thread_ofs = 0;
-
-    for(int j=0; j<block_num; j++)
-    {
-        sign_flag[j] = 0;
-        temp_start_idx = start_idx + j*32;
-        temp_end_idx = temp_start_idx + 32;
-        block_idx = start_block_idx+j;
-        prevQuant = 0;
-        maxQuant = 0;
-
-        for(int i=temp_start_idx; i<temp_end_idx; i++)
-        {
-            quant_chunk_idx = i%cmp_chunk_f32;
-            currQuant = quantization_f32(oriData[i], recipPrecision);
-            lorenQuant = currQuant - prevQuant;
-            prevQuant = currQuant;
-            sign_ofs = i % 32;
-            sign_flag[j] |= (lorenQuant < 0) << (31 - sign_ofs);
-            absQuant[quant_chunk_idx] = abs(lorenQuant);
-            maxQuant = maxQuant > absQuant[quant_chunk_idx] ? maxQuant : absQuant[quant_chunk_idx];
-        }
-
-        fixed_rate[j] = get_bit_num(maxQuant);
-        thread_ofs += (fixed_rate[j]) ? (32+fixed_rate[j]*32) : 0;
-        if(block_idx<rate_ofs) cmpData[block_idx] = (unsigned char)fixed_rate[j];
-    }
     __syncthreads();
 
     for(int i=1; i<32; i<<=1)
@@ -107,18 +60,79 @@ __global__ void SZplus_compress_kernel_f32(
             __threadfence();
             flag[warp+1] = 2;
         }
-        
     }
     __syncthreads();
 
     if(!lane) base_idx = cmpOffset[warp] + rate_ofs;
     __syncthreads();
 
-    unsigned int prev_thread = __shfl_up_sync(0xffffffff, thread_ofs, 1);
-    unsigned int cmp_byte_ofs;
+    uint32_t prev_thread = __shfl_up_sync(0xffffffff, thread_ofs, 1);
+    uint32_t cmp_byte_ofs;
     if(!lane) cmp_byte_ofs = base_idx;
     else cmp_byte_ofs = base_idx + prev_thread / 8;
-    
+
+    return cmp_byte_ofs;
+}
+
+__global__ void SZplus_compress_kernel_f32(
+    const float* const __restrict__ oriData,
+    uint8_t* const __restrict__ cmpData,
+    volatile uint32_t* const __restrict__ cmpOffset,
+    volatile int* const __restrict__ flag,
+    const float eb,
+    const size_t nbEle)
+{
+    __shared__ uint32_t base_idx;
+
+    const int tid = threadIdx.x;
+    const int idx = blockIdx.x * blockDim.x + tid;
+    const int lane = idx & 31;
+    const int warp = idx >> 5;
+    const int block_num = cmp_chunk_f32/32;
+    const int start_idx = idx * cmp_chunk_f32;
+    const int start_block_idx = start_idx/32;
+    const int rate_ofs = (nbEle+31)/32;
+    const float recipPrecision = 0.5f/eb;
+
+    int temp_start_idx, temp_end_idx;
+    int quant_chunk_idx;
+    int block_idx;
+    int currQuant, lorenQuant, prevQuant, maxQuant;
+    int absQuant[cmp_chunk_f32];
+    uint32_t sign_flag[block_num];
+    int sign_ofs;
+    int fixed_rate[block_num];
+    uint32_t thread_ofs = 0;
+
+    for(int j = 0; j < block_num; j++)
+    {
+        sign_flag[j] = 0;
+        temp_start_idx = start_idx + j*32;
+        temp_end_idx = temp_start_idx + 32;
+        block_idx = start_block_idx+j;
+        prevQuant = 0;
+        maxQuant = 0;
+
+        for(int i = temp_start_idx; i < temp_end_idx; i++)
+        {
+            quant_chunk_idx = i%cmp_chunk_f32;
+            // This is the same quantization used by torch.round()
+            currQuant = __float2int_rn(oriData[i] * recipPrecision);
+            lorenQuant = currQuant - prevQuant;
+            prevQuant = currQuant;
+            sign_ofs = i % 32;
+            sign_flag[j] |= (lorenQuant < 0) << (31 - sign_ofs);
+            absQuant[quant_chunk_idx] = abs(lorenQuant);
+            maxQuant = maxQuant > absQuant[quant_chunk_idx] ? maxQuant : absQuant[quant_chunk_idx];
+        }
+
+        fixed_rate[j] = get_bit_num(maxQuant);
+        thread_ofs += (fixed_rate[j]) ? (32+fixed_rate[j]*32) : 0;
+        if(block_idx<rate_ofs) cmpData[block_idx] = (uint8_t)fixed_rate[j];
+    }
+
+    uint32_t cmp_byte_ofs = sync_offsets(thread_ofs, cmpOffset, flag, nbEle);
+
     for(int j=0; j<block_num; j++)  
     {
         int chunk_idx_start = j*32;
@@ -131,7 +145,7 @@ __global__ void SZplus_compress_kernel_f32(
             cmpData[cmp_byte_ofs++] = 0xff & (sign_flag[j] >> 8);
             cmpData[cmp_byte_ofs++] = 0xff & sign_flag[j];
 
-            unsigned char tmp_char0, tmp_char1, tmp_char2, tmp_char3;
+            uint8_t tmp_char0, tmp_char1, tmp_char2, tmp_char3;
             int mask = 1;
             for(int i=0; i<rate; i++)
             {
@@ -189,13 +203,13 @@ __global__ void SZplus_compress_kernel_f32(
 
 __global__ void SZplus_decompress_kernel_f32(
     float* const __restrict__ decData,
-    const unsigned char* const __restrict__ cmpData,
-    volatile unsigned int* const __restrict__ cmpOffset,
+    const uint8_t* const __restrict__ cmpData,
+    volatile uint32_t* const __restrict__ cmpOffset,
     volatile int* const __restrict__ flag,
     const float eb,
     const size_t nbEle)
 {
-    __shared__ unsigned int base_idx;
+    __shared__ uint32_t base_idx;
 
     const int tid = threadIdx.x;
     const int idx = blockIdx.x * blockDim.x + tid;
@@ -212,7 +226,7 @@ __global__ void SZplus_decompress_kernel_f32(
     int currQuant, lorenQuant, prevQuant;
     int sign_ofs;
     int fixed_rate[block_num];
-    unsigned int thread_ofs = 0;
+    uint32_t thread_ofs = 0;
 
     for(int j=0; j<block_num; j++)
     {
@@ -223,58 +237,13 @@ __global__ void SZplus_decompress_kernel_f32(
             thread_ofs += (fixed_rate[j]) ? (32+fixed_rate[j]*32) : 0;
         }
     }
-    __syncthreads();
 
-    for(int i=1; i<32; i<<=1)
-    {
-        int tmp = __shfl_up_sync(0xffffffff, thread_ofs, i);
-        if(lane >= i) thread_ofs += tmp;
-    }
-    __syncthreads();
-
-    if(lane==31) 
-    {
-        cmpOffset[warp+1] = (thread_ofs+7)/8;
-        __threadfence();
-        if(warp==0)
-        {
-            flag[1] = 2;
-            __threadfence();
-        }
-        else
-        {
-            flag[warp+1] = 1;
-            __threadfence();
-        }
-    }
-    __syncthreads();
-
-    if(warp>0)
-    {
-        if(!lane)
-        {
-            int temp_flag = 1;
-            while(temp_flag!=2) temp_flag = flag[warp];
-            __threadfence();
-            cmpOffset[warp] += cmpOffset[warp-1];
-            __threadfence();
-            flag[warp+1] = 2;
-        }
-    }
-    __syncthreads();
-
-    if(!lane) base_idx = cmpOffset[warp] + rate_ofs;
-    __syncthreads();
-
-    unsigned int prev_thread = __shfl_up_sync(0xffffffff, thread_ofs, 1);
-    unsigned int cmp_byte_ofs;
-    if(!lane) cmp_byte_ofs = base_idx;
-    else cmp_byte_ofs = base_idx + prev_thread / 8;
+    uint32_t cmp_byte_ofs = sync_offsets(thread_ofs, cmpOffset, flag, nbEle);
 
     for(int j=0; j<block_num; j++)
     {
         temp_start_idx = start_idx + j*32;
-        unsigned int sign_flag = 0;
+        uint32_t sign_flag = 0;
 
         if(fixed_rate[j])
         {
@@ -283,7 +252,7 @@ __global__ void SZplus_decompress_kernel_f32(
                         (0x0000ff00 & (cmpData[cmp_byte_ofs++] << 8))  |
                         (0x000000ff & cmpData[cmp_byte_ofs++]);
             
-            unsigned char tmp_char0, tmp_char1, tmp_char2, tmp_char3;
+            uint8_t tmp_char0, tmp_char1, tmp_char2, tmp_char3;
             for(int i=0; i<32; i++) absQuant[i] = 0;
             for(int i=0; i<fixed_rate[j]; i++)
             {
@@ -353,7 +322,7 @@ __global__ void SZplus_decompress_kernel_f32(
 
 int SZplus_compress_hostptr_f32(
     float* oriData,
-    unsigned char* cmpBytes,
+    uint8_t* cmpBytes,
     size_t nbEle,
     size_t* cmpSize,
     float errorBound)
@@ -366,8 +335,8 @@ int SZplus_compress_hostptr_f32(
 
     // Initializing global memory for GPU compression.
     float* d_oriData = NULL;
-    unsigned char* d_cmpData = NULL;
-    unsigned int* d_cmpOffset = NULL;
+    uint8_t* d_cmpData = NULL;
+    uint32_t* d_cmpOffset = NULL;
     int* d_flag = NULL;
     cudaError_t err = cudaMalloc((void**)&d_oriData, sizeof(float)*pad_nbEle);
     printf("pad_nbEle: %zu\n", pad_nbEle);
@@ -385,10 +354,10 @@ int SZplus_compress_hostptr_f32(
     if (err != cudaSuccess) { return -1; }
 
     printf("cmpOffSize: %zu\n", cmpOffSize);
-    err = cudaMallocManaged((void**)&d_cmpOffset, sizeof(unsigned int)*cmpOffSize);
+    err = cudaMallocManaged((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
     if (err != cudaSuccess) { return -1; }
 
-    cudaMemset(d_cmpOffset, 0, sizeof(unsigned int)*cmpOffSize);
+    cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
     err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
     printf("cmpOffSize: %zu\n", cmpOffSize);
     if (err != cudaSuccess) { return -1; }
@@ -426,7 +395,7 @@ int SZplus_compress_hostptr_f32(
 
 int SZplus_decompress_hostptr_f32(
     float* decData,
-    unsigned char* cmpBytes,
+    uint8_t* cmpBytes,
     size_t nbEle,
     size_t cmpSize,
     float errorBound)
@@ -439,8 +408,8 @@ int SZplus_decompress_hostptr_f32(
 
     // Initializing global memory for GPU compression.
     float* d_decData = NULL;
-    unsigned char* d_cmpData = NULL;
-    unsigned int* d_cmpOffset = NULL;
+    uint8_t* d_cmpData = NULL;
+    uint32_t* d_cmpOffset = NULL;
     int* d_flag = NULL;
     cudaError_t err = cudaMalloc((void**)&d_decData, sizeof(float)*pad_nbEle);
     if (err != cudaSuccess) { return -1; }
@@ -448,9 +417,9 @@ int SZplus_decompress_hostptr_f32(
     err = cudaMalloc((void**)&d_cmpData, sizeof(float)*pad_nbEle);
     if (err != cudaSuccess) { return -1; }
     cudaMemcpy(d_cmpData, cmpBytes, cmpSize, cudaMemcpyHostToDevice);
-    err = cudaMalloc((void**)&d_cmpOffset, sizeof(unsigned int)*cmpOffSize);
+    err = cudaMalloc((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
     if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_cmpOffset, 0, sizeof(unsigned int)*cmpOffSize);
+    cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
     err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
     if (err != cudaSuccess) { return -1; }
     cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
@@ -482,7 +451,7 @@ int SZplus_decompress_hostptr_f32(
 
 int SZplus_compress_deviceptr_f32(
     float* d_oriData,
-    unsigned char* d_cmpBytes,
+    uint8_t* d_cmpBytes,
     size_t nbEle,
     size_t* cmpSize,
     float errorBound,
@@ -495,11 +464,11 @@ int SZplus_compress_deviceptr_f32(
     int pad_nbEle = gsize * bsize * cmp_chunk_f32;
 
     // Initializing global memory for GPU compression.
-    unsigned int* d_cmpOffset = NULL;
+    uint32_t* d_cmpOffset = NULL;
     int* d_flag = NULL;
-    cudaError_t err = cudaMallocManaged((void**)&d_cmpOffset, sizeof(unsigned int)*cmpOffSize);
+    cudaError_t err = cudaMallocManaged((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
     if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_cmpOffset, 0, sizeof(unsigned int)*cmpOffSize);
+    cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
     err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
     if (err != cudaSuccess) { return -1; }
     cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
@@ -523,7 +492,7 @@ int SZplus_compress_deviceptr_f32(
 
 int SZplus_decompress_deviceptr_f32(
     float* d_decData,
-    unsigned char* d_cmpBytes,
+    uint8_t* d_cmpBytes,
     size_t nbEle,
     size_t cmpSize,
     float errorBound,
@@ -535,11 +504,11 @@ int SZplus_decompress_deviceptr_f32(
     int cmpOffSize = gsize + 1;
 
     // Initializing global memory for GPU compression.
-    unsigned int* d_cmpOffset = NULL;
+    uint32_t* d_cmpOffset = NULL;
     int* d_flag = NULL;
-    cudaError_t err = cudaMalloc((void**)&d_cmpOffset, sizeof(unsigned int)*cmpOffSize);
+    cudaError_t err = cudaMalloc((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
     if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_cmpOffset, 0, sizeof(unsigned int)*cmpOffSize);
+    cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
     err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
     if (err != cudaSuccess) { return -1; }
     cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);

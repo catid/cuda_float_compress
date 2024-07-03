@@ -2,29 +2,31 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 // Returns 0 if successful, otherwise returns error code.
 int SZplus_compress_hostptr_f32(
     float* oriData,
-    unsigned char* cmpBytes,
+    uint8_t* cmpBytes,
     size_t nbEle,
     size_t* cmpSize,
     float errorBound);
 int SZplus_decompress_hostptr_f32(
     float* decData,
-    unsigned char* cmpBytes,
+    uint8_t* cmpBytes,
     size_t nbEle,
     size_t cmpSize,
     float errorBound);
 int SZplus_compress_deviceptr_f32(
     float* d_oriData,
-    unsigned char* d_cmpBytes,
+    uint8_t* d_cmpBytes,
     size_t nbEle,
     size_t* cmpSize,
     float errorBound,
     cudaStream_t stream = 0);
 int SZplus_decompress_deviceptr_f32(
     float* d_decData,
-    unsigned char* d_cmpBytes,
+    uint8_t* d_cmpBytes,
     size_t nbEle,
     size_t cmpSize,
     float errorBound,
