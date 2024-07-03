@@ -10,6 +10,7 @@ Python package for compressing floating-point PyTorch tensors using the [cuSZp](
 ```bash
 git clone https://github.com/catid/cuda_float_compress
 cd cuda_float_compress
+git submodule update --init --recursive
 
 conda create -n cfc python=3.10 -y && conda activate cfc
 
