@@ -4,6 +4,7 @@ WORK IN PROGRESS
 
 Python package for compressing floating-point PyTorch tensors using the [cuSZp](https://github.com/szcompressor/cuSZp) library.
 
+
 ## Setup
 
 ```bash
@@ -15,12 +16,13 @@ conda create -n cfc python=3.10 -y && conda activate cfc
 pip install -e .
 ```
 
+
 ## Testing
 
 After installing the package, you can run the example script:
 
 ```bash
-cd examples
+conda activate cfc
 
-python model_compress_example.py
+python examples/model_compress_example.py
 ```

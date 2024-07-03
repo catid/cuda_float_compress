@@ -71,7 +71,7 @@ torch::Tensor cuszp_decompress(torch::Tensor compressed, size_t nbEle, size_t cm
     return result;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+PYBIND11_MODULE(cuda_float_compress, m) {
     m.def("cuszp_compress", &cuszp_compress, "cuszp_compress");
     m.def("cuszp_decompress", &cuszp_decompress, "cuszp_decompress");
 }

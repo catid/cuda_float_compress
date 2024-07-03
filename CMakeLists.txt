@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(cuda_float_compress LANGUAGES CXX)
+project(cuda_float_compress LANGUAGES CXX CUDA)
 
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
 
@@ -15,7 +15,7 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
     # -fsanitize=address
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -march=native")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -flto")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
 endif()
 
 # For pybind11 to work on Linux.
@@ -35,20 +35,19 @@ find_package(Python3 3.7 COMPONENTS Interpreter Development NumPy)
 # Make sure we are compatible with torch ABI. Must go before any
 # add_subdirectory.
 execute_process(
-    COMMAND
-        python -c
-        "import torch; import os; print(int(torch._C._GLIBCXX_USE_CXX11_ABI), end='')"
-        OUTPUT_VARIABLE TorchAbi)
+    COMMAND python -c "import torch; import os; print(int(torch._C._GLIBCXX_USE_CXX11_ABI), end='')"
+    OUTPUT_VARIABLE TorchAbi
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
 add_definitions(-D_GLIBCXX_USE_CXX11_ABI=${TorchAbi})
 
-set(PYBIND11_FINDPYTHON ON)
-find_package(pybind11 CONFIG REQUIRED)
+add_subdirectory(pybind11)
 
 # Link to Torch
 if(NOT TARGET torch_library)
     execute_process(
     COMMAND
-        python -c
+        ${Python3_EXECUTABLE} -c
         "import torch; import os; print(os.path.dirname(torch.__file__), end='')"
     OUTPUT_VARIABLE TORCH_PATH)
     list(APPEND CMAKE_PREFIX_PATH ${TORCH_PATH})
@@ -74,19 +73,14 @@ if(NOT TARGET torch_library)
     find_package(Torch REQUIRED)
 endif()
 
-# Find CUDA without using the deprecated FindCUDA module
-include(CheckLanguage)
-check_language(CUDA)
-if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
-else()
-    message(FATAL_ERROR "No CUDA support found")
-endif()
+find_package(CUDAToolkit REQUIRED)
 
 set(CUSZP_BUILD_EXAMPLES OFF)
 add_subdirectory(cuSZp)
 
 pybind11_add_module(cuda_float_compress cuda_float_compress.cpp)
+
+find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
 
 target_include_directories(cuda_float_compress PUBLIC
     ${Python3_INCLUDE_DIRS}
@@ -94,11 +88,12 @@ target_include_directories(cuda_float_compress PUBLIC
 )
 target_link_libraries(cuda_float_compress PRIVATE
     ${TORCH_LIBRARIES}
-    ${TORCH_PYTHON_LIBRARIES}
+    ${TORCH_PYTHON_LIBRARY}
     cuSZp
     Python3::NumPy
-    CUDA::cudart
+    CUDA::cudart_static
     Threads::Threads
+    pybind11::module
 )
 set_target_properties(cuda_float_compress PROPERTIES PREFIX "") # remove lib prefix
 
