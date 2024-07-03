@@ -1,13 +1,34 @@
 cmake_minimum_required(VERSION 3.21)
 project(cuda_float_compress LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
+
+if(MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
+    # -fsanitize=address
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -march=native")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -flto")
+endif()
 
 # For pybind11 to work on Linux.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -fPIC")
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Dependencies
+set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 find_package(Python3 3.7 COMPONENTS Interpreter Development NumPy)
 
@@ -23,7 +44,7 @@ add_definitions(-D_GLIBCXX_USE_CXX11_ABI=${TorchAbi})
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 CONFIG REQUIRED)
 
-# TORCH LIB  #####
+# Link to Torch
 if(NOT TARGET torch_library)
     execute_process(
     COMMAND
@@ -32,12 +53,22 @@ if(NOT TARGET torch_library)
     OUTPUT_VARIABLE TORCH_PATH)
     list(APPEND CMAKE_PREFIX_PATH ${TORCH_PATH})
 
-    # If you want to target specific CUDA architectures, uncomment the line below
-    #set(TORCH_CUDA_ARCH_LIST "6.0;7.0;7.5;8.0;8.6")
-
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 50 52 60 61 70 75 80 86)
+    endif()
+ 
     # Note there is a noisy warning for missing kineto here
     # https://github.com/pytorch/pytorch/issues/62588
     find_package(Torch REQUIRED)
+endif()
+
+# Find CUDA without using the deprecated FindCUDA module
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+else()
+    message(FATAL_ERROR "No CUDA support found")
 endif()
 
 add_subdirectory(cuSZp)
@@ -53,6 +84,8 @@ target_link_libraries(cuda_float_compress PRIVATE
     ${TORCH_PYTHON_LIBRARIES}
     cuSZp
     Python3::NumPy
+    CUDA::cudart
 )
+set_target_properties(cuda_float_compress PROPERTIES PREFIX "") # remove lib prefix
 
 install(TARGETS cuda_float_compress DESTINATION .)

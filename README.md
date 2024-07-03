@@ -12,3 +12,13 @@ conda create -n cfc python=3.10 -y && conda activate cfc
 
 pip install -e .
 ```
+
+## Testing
+
+After installing the package, you can run the example script:
+
+```bash
+cd examples
+
+python model_compress_example.py
+```
