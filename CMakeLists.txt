@@ -57,6 +57,18 @@ if(NOT TARGET torch_library)
         set(CMAKE_CUDA_ARCHITECTURES 50 52 60 61 70 75 80 86)
     endif()
  
+    # Find PyTorch installation
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import torch; print(f'{torch.utils.cmake_prefix_path}/Torch')"
+        OUTPUT_VARIABLE Torch_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
+    if(NOT Torch_DIR)
+        message(FATAL_ERROR "PyTorch installation not found. Make sure it's installed in the current Python environment.")
+    endif()
+    message(STATUS "Found PyTorch installation: ${Torch_DIR}")
+
     # Note there is a noisy warning for missing kineto here
     # https://github.com/pytorch/pytorch/issues/62588
     find_package(Torch REQUIRED)
@@ -71,6 +83,7 @@ else()
     message(FATAL_ERROR "No CUDA support found")
 endif()
 
+set(CUSZP_BUILD_EXAMPLES OFF)
 add_subdirectory(cuSZp)
 
 pybind11_add_module(cuda_float_compress cuda_float_compress.cpp)
@@ -79,7 +92,7 @@ target_include_directories(cuda_float_compress PUBLIC
     ${Python3_INCLUDE_DIRS}
     ${Python3_NumPy_INCLUDE_DIRS}
 )
-target_link_libraries(cuda_float_compress PUBLIC
+target_link_libraries(cuda_float_compress PRIVATE
     ${TORCH_LIBRARIES}
     ${TORCH_PYTHON_LIBRARIES}
     cuSZp

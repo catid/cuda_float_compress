@@ -7,14 +7,10 @@ requires = [
 ]
 build-backend = "scikit_build_core.build"
 
-[tool.scikit-build]
-cmake.minimum-version = "3.21"
-cmake.args = ["-DCUSZP_BUILD_EXAMPLES=OFF"]
-
 [project]
 name = "cuda_float_compress"
 version = "0.1.0"
-description = "A PyTorch CUDA extension for cuSZp compression"
+description = "A PyTorch CUDA extension for floating-point compression"
 requires-python = ">=3.7"
 dependencies = [
     "torch",
