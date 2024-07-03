@@ -77,6 +77,10 @@ target_link_libraries(cuda_float_compress PRIVATE
     pybind11::module
 )
 set_target_properties(cuda_float_compress PROPERTIES PREFIX "") # remove lib prefix
-set_target_properties(${PROJECT_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+
+set_target_properties(cuda_float_compress PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+install(TARGETS cuda_float_compress
+    LIBRARY DESTINATION .
+    RUNTIME DESTINATION .)
 
 message(STATUS "CMAKE_LIBRARY_OUTPUT_DIRECTORY: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
