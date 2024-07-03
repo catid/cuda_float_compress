@@ -1,6 +1,8 @@
-# cuda_float_compress
+# cuda_float_compress [WIP]
 
-CUDA floating-point compression PIP package
+WORK IN PROGRESS
+
+Python package for compressing floating-point PyTorch tensors using the [cuSZp](https://github.com/szcompressor/cuSZp) library.
 
 ## Setup
 
