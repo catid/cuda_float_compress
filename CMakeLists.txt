@@ -79,12 +79,13 @@ target_include_directories(cuda_float_compress PUBLIC
     ${Python3_INCLUDE_DIRS}
     ${Python3_NumPy_INCLUDE_DIRS}
 )
-target_link_libraries(cuda_float_compress PRIVATE
+target_link_libraries(cuda_float_compress PUBLIC
     ${TORCH_LIBRARIES}
     ${TORCH_PYTHON_LIBRARIES}
     cuSZp
     Python3::NumPy
     CUDA::cudart
+    Threads::Threads
 )
 set_target_properties(cuda_float_compress PROPERTIES PREFIX "") # remove lib prefix
 
