@@ -9,12 +9,10 @@ __device__ inline int quantization_f32(float data, float recipPrecision)
     return (int)(dataRecip+0.5f) - s;
 }
 
-
 __device__ inline int get_bit_num(unsigned int x)
 {
     return (sizeof(unsigned int)*8) - __clz(x);
 }
-
 
 __global__ void SZplus_compress_kernel_f32(
     const float* const __restrict__ oriData,
@@ -353,7 +351,12 @@ __global__ void SZplus_decompress_kernel_f32(
     printf("cmp_byte_ofs = %d\n", (int)cmp_byte_ofs);
 }
 
-int SZplus_compress_hostptr_f32(float* oriData, unsigned char* cmpBytes, size_t nbEle, size_t* cmpSize, float errorBound)
+int SZplus_compress_hostptr_f32(
+    float* oriData,
+    unsigned char* cmpBytes,
+    size_t nbEle,
+    size_t* cmpSize,
+    float errorBound)
 {
     // Data blocking.
     int bsize = cmp_tblock_size_f32;
@@ -421,8 +424,12 @@ int SZplus_compress_hostptr_f32(float* oriData, unsigned char* cmpBytes, size_t 
     return 0;
 }
 
-
-int SZplus_decompress_hostptr_f32(float* decData, unsigned char* cmpBytes, size_t nbEle, size_t cmpSize, float errorBound)
+int SZplus_decompress_hostptr_f32(
+    float* decData,
+    unsigned char* cmpBytes,
+    size_t nbEle,
+    size_t cmpSize,
+    float errorBound)
 {
     // Data blocking.
     int bsize = dec_tblock_size_f32;
@@ -473,8 +480,13 @@ int SZplus_decompress_hostptr_f32(float* decData, unsigned char* cmpBytes, size_
     return 0;
 }
 
-
-int SZplus_compress_deviceptr_f32(float* d_oriData, unsigned char* d_cmpBytes, size_t nbEle, size_t* cmpSize, float errorBound, cudaStream_t stream)
+int SZplus_compress_deviceptr_f32(
+    float* d_oriData,
+    unsigned char* d_cmpBytes,
+    size_t nbEle,
+    size_t* cmpSize,
+    float errorBound,
+    cudaStream_t stream)
 {
     // Data blocking.
     int bsize = cmp_tblock_size_f32;
@@ -509,8 +521,13 @@ int SZplus_compress_deviceptr_f32(float* d_oriData, unsigned char* d_cmpBytes, s
     return 0;
 }
 
-
-int SZplus_decompress_deviceptr_f32(float* d_decData, unsigned char* d_cmpBytes, size_t nbEle, size_t cmpSize, float errorBound, cudaStream_t stream)
+int SZplus_decompress_deviceptr_f32(
+    float* d_decData,
+    unsigned char* d_cmpBytes,
+    size_t nbEle,
+    size_t cmpSize,
+    float errorBound,
+    cudaStream_t stream)
 {
     // Data blocking.
     int bsize = dec_tblock_size_f32;
