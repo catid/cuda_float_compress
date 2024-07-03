@@ -12,7 +12,7 @@ message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 if(MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -flto=auto")
     # -fsanitize=address
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -march=native")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
@@ -62,7 +62,7 @@ add_subdirectory(cuSZp)
 
 add_subdirectory(pybind11)
 
-pybind11_add_module(cuda_float_compress cuda_float_compress.cpp)
+pybind11_add_module(cuda_float_compress src/cuda_float_compress.cpp)
 
 target_include_directories(cuda_float_compress PUBLIC
     ${Python3_INCLUDE_DIRS}
@@ -77,5 +77,6 @@ target_link_libraries(cuda_float_compress PRIVATE
     pybind11::module
 )
 set_target_properties(cuda_float_compress PROPERTIES PREFIX "") # remove lib prefix
+set_target_properties(${PROJECT_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
 
-install(TARGETS cuda_float_compress DESTINATION .)
+message(STATUS "CMAKE_LIBRARY_OUTPUT_DIRECTORY: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
