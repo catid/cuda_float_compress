@@ -1,48 +1,73 @@
 import torch
 import torchvision.models as models
 import cuda_float_compress
+import zstandard as zstd
+import numpy as np
 
-def compress_model_params(model, error_bound):
-    # Get all parameters from the model
-    params = [p.data for p in model.parameters()]
+# Function to compress a tensor using Zstd
+def compress_tensor_zstd(tensor, compression_level=1):
+    # Convert tensor to bytes
+    tensor_bytes = tensor.cpu().numpy().tobytes()
     
-    # Flatten and concatenate all parameters into a single tensor
-    flattened_params = torch.cat([p.view(-1) for p in params])
+    # Create a Zstd compressor
+    cctx = zstd.ZstdCompressor(level=compression_level)
     
-    # Ensure the tensor is on CPU and in float32 format
-    flattened_params = flattened_params.cpu().float()
+    # Compress the tensor bytes
+    compressed_data = cctx.compress(tensor_bytes)
     
-    # Compress the flattened parameters
-    compressed_params = cuda_float_compress.cuszp_compress(flattened_params, error_bound)
-    
-    return compressed_params, flattened_params.numel()
+    return compressed_data
 
-def decompress_model_params(compressed_params, num_elements, error_bound):
-    # Decompress the parameters
-    decompressed_params = cuda_float_compress.cuszp_decompress(compressed_params, num_elements, compressed_params.numel(), error_bound)
+# Function to decompress Zstd compressed data back to a tensor
+def decompress_tensor_zstd(compressed_data, expected_bytes):
+    # Create a Zstd decompressor
+    dctx = zstd.ZstdDecompressor()
     
-    return decompressed_params
+    # Decompress the data
+    decompressed_bytes = dctx.decompress(compressed_data)
+
+    if len(decompressed_bytes) != expected_bytes:
+        return None
+
+    tensor = torch.tensor(np.frombuffer(decompressed_bytes, dtype=np.uint8))
+
+    return tensor
 
 def main():
     # Load a pretrained model (e.g., ResNet18)
     model = models.resnet18(pretrained=True)
-    
-    # Set error bound for compression (adjust as needed)
-    error_bound = 1e-4
-    
-    # Compress model parameters
-    compressed_params, num_elements = compress_model_params(model, error_bound)
 
-    print(f"Original model size: {num_elements * 4 / 1000 / 1000:.2f} MB")
-    print(f"Compressed model size: {compressed_params.numel() / 1000 / 1000:.2f} MB")
-
-    # Decompress model parameters
-    decompressed_params = decompress_model_params(compressed_params, num_elements, error_bound)
-    
     # Verify decompression
     original_params = torch.cat([p.data.view(-1) for p in model.parameters()])
-    mse = torch.mean((original_params - decompressed_params) ** 2)
-    print(f"Mean Squared Error after compression/decompression: {mse.item()}")
+    print(f"oring_params.shape: {original_params.shape}")
+    for p in model.parameters():
+        data = p.data.view(-1)
+
+        (d_min, d_max) = torch.aminmax(data.detach())
+        range = (d_max - d_min).float()
+        rescaled = (data - d_min).float() / range
+
+        raw_data = rescaled
+
+        print(f"raw_data = {raw_data}")
+
+        # Set error bound for compression (adjust as needed)
+        error_bound = 0.00001
+
+        num_elements = raw_data.numel()
+        compressed_params = cuda_float_compress.cuszplus_compress(raw_data, error_bound)
+
+        print(f"compressed_params = {compressed_params}")
+
+        zcomp = compress_tensor_zstd(compressed_params)
+
+        dcomp = decompress_tensor_zstd(zcomp, compressed_params.numel())
+
+        decompressed_params = cuda_float_compress.cuszplus_decompress(compressed_params, num_elements, error_bound)
+
+        mse = torch.mean((raw_data - decompressed_params) ** 2)
+        ratio = raw_data.numel() * 4.0 / compressed_params.numel()
+        zratio = raw_data.numel() * 4.0 / len(zcomp)
+        print(f"Mean Squared Error after compression/decompression: {mse.item()} Ratio: {ratio:.2f} ZRatio: {zratio:.2f}")
 
 if __name__ == "__main__":
     main()

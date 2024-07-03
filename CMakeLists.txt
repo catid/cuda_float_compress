@@ -30,6 +30,15 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+find_package(CUDAToolkit REQUIRED)
+
+set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+set(CMAKE_CUDA_STANDARD "17")
+set(CMAKE_CUDA_FLAGS_INIT "-std=c++17 -allow-unsupported-compiler")
+set(CMAKE_CUDA_ARCHITECTURES 60 61 62 70 75 80 86)
+set(CUDA_PROPAGATE_HOST_FLAGS ON)
+
 # Dependencies
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
@@ -63,12 +72,12 @@ if(NOT TARGET torch_library)
     find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
 endif()
 
-set(CUSZP_BUILD_EXAMPLES OFF)
-add_subdirectory(cuSZp)
-
 add_subdirectory(pybind11)
 
-pybind11_add_module(cuda_float_compress src/cuda_float_compress.cpp)
+pybind11_add_module(cuda_float_compress
+    src/cuda_float_compress.cpp
+    src/cuszplus_f32.cu
+)
 
 target_include_directories(cuda_float_compress PUBLIC
     ${Python3_INCLUDE_DIRS}
@@ -77,10 +86,10 @@ target_include_directories(cuda_float_compress PUBLIC
 target_link_libraries(cuda_float_compress PRIVATE
     ${TORCH_LIBRARIES}
     ${TORCH_PYTHON_LIBRARY}
-    cuSZp
     Python3::NumPy
     Threads::Threads
     pybind11::module
+    CUDA::cudart
 )
 set_target_properties(cuda_float_compress PROPERTIES PREFIX "") # remove lib prefix
 

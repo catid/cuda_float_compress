@@ -2,7 +2,7 @@
 
 WORK IN PROGRESS
 
-Python package for compressing floating-point PyTorch tensors using the [cuSZp](https://github.com/szcompressor/cuSZp) library.
+Python package for compressing floating-point PyTorch tensors based on the [cuSZp](https://github.com/szcompressor/cuSZp) project.
 
 
 ## Setup
