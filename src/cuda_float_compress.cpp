@@ -68,16 +68,16 @@ torch::Tensor cuszplus_decompress(torch::Tensor compressed, size_t nbEle, float 
         // CPU processing
         int r = SZplus_decompress_hostptr_f32(result.data_ptr<float>(), compressed.data_ptr<unsigned char>(), nbEle, cmpSize, errorBound);
         if (r != 0) {
-            throw std::runtime_error("SZp_decompress_hostptr_f32 failed");
+            throw std::runtime_error("SZplus_decompress_hostptr_f32 failed");
         }
     } else {
         // GPU processing
         cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
         int r = SZplus_decompress_deviceptr_f32(result.data_ptr<float>(), compressed.data_ptr<unsigned char>(), nbEle, cmpSize, errorBound, stream);
         if (r != 0) {
-            throw std::runtime_error("SZp_decompress_deviceptr_f32 failed");
+            throw std::runtime_error("SZplus_decompress_deviceptr_f32 failed");
         }
-        checkCudaErrors(cudaGetLastError(), "SZp_compress_deviceptr_f32");
+        checkCudaErrors(cudaGetLastError(), "SZplus_decompress_deviceptr_f32");
         checkCudaErrors(cudaStreamSynchronize(stream), "cudaStreamSynchronize after compression");
     }
 

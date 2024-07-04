@@ -1,10 +1,55 @@
 #include "cuszplus_f32.h"
 
+// FIXME: REMOVE THIS
 #include <stdio.h>
 
-__device__ inline int get_bit_num(uint32_t x)
+//------------------------------------------------------------------------------
+// Tools
+
+__device__ inline uint32_t bit_count(uint32_t x)
 {
     return (sizeof(uint32_t)*8) - __clz(x);
+}
+
+__device__ inline uint32_t zigzag_encode(uint32_t x)
+{
+    return (x << 1) ^ (x >> 31);
+}
+
+__device__ inline int32_t zigzag_decode(uint32_t x)
+{
+    return (x >> 1) ^ -(x & 1);
+}
+
+__device__ inline uint32_t pack_bits(const uint32_t* absQuant, int bit_pos) {
+    uint8_t result = 0;
+    uint32_t mask = 1U << bit_pos;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        result |= ((absQuant[j] & mask) != 0) << (7 - j);
+    }
+    return result;
+}
+
+// Returns number of bytes written
+__device__ inline int pack_block_bits(
+    const uint32_t* absQuant,
+    uint8_t* cmpData,
+    int rate
+) {
+    for (int i = 0; i < rate; i++) {
+        int offset = i * sizeof(uint32_t);
+        const uint32_t packed_data = 
+            pack_bits(absQuant + offset,      i) |
+            pack_bits(absQuant + offset + 8,  i) << 8  |
+            pack_bits(absQuant + offset + 16, i) << 16 |
+            pack_bits(absQuant + offset + 24, i) << 24;
+
+        // Safe unaligned store
+        __stcg(cmpData + offset, packed_data);
+    }
+
+    return rate * sizeof(uint32_t);
 }
 
 __device__ uint32_t sync_offsets(
@@ -20,59 +65,76 @@ __device__ uint32_t sync_offsets(
     const int idx = blockIdx.x * blockDim.x + tid;
     const int lane = idx & 31;
     const int warp = idx >> 5;
-    const int rate_ofs = (nbEle+31)/32;
+    const int rate_ofs = (nbEle + 31) / 32;
 
     __syncthreads();
 
-    for(int i=1; i<32; i<<=1)
-    {
+    for (int i = 1; i < 32; i <<= 1) {
         int tmp = __shfl_up_sync(0xffffffff, thread_ofs, i);
-        if(lane >= i) thread_ofs += tmp;
+        if (lane >= i) {
+            thread_ofs += tmp;
+        }
     }
+
     __syncthreads();
 
-    if(lane==31) 
-    {
-        cmpOffset[warp+1] = (thread_ofs+7)/8;
+    if (lane == 31) {
+        cmpOffset[warp + 1] = (thread_ofs + 7) / 8;
+
         __threadfence();
-        if(warp==0)
-        {
+
+        if (warp == 0) {
             flag[1] = 2;
-            __threadfence();
+        } else {
+            flag[warp + 1] = 1;
         }
-        else
-        {
-            flag[warp+1] = 1;
-            __threadfence();
-        }
+
+        __threadfence();
     }
+
     __syncthreads();
 
-    if(warp>0)
+    if (warp > 0 && lane == 0)
     {
-        if(!lane)
-        {
-            int temp_flag = 1;
-            while(temp_flag!=2) temp_flag = flag[warp];
-            __threadfence();
-            cmpOffset[warp] += cmpOffset[warp-1];
-            if(warp==gridDim.x-1) cmpOffset[warp+1] += cmpOffset[warp];
-            __threadfence();
-            flag[warp+1] = 2;
+        int temp_flag = 1;
+        while (temp_flag != 2) {
+            temp_flag = flag[warp];
         }
+
+        __threadfence();
+
+        cmpOffset[warp] += cmpOffset[warp - 1];
+
+        if (warp == gridDim.x - 1) {
+            cmpOffset[warp + 1] += cmpOffset[warp];
+        }
+
+        __threadfence();
+
+        flag[warp + 1] = 2;
     }
+
     __syncthreads();
 
-    if(!lane) base_idx = cmpOffset[warp] + rate_ofs;
+    if (lane == 0) {
+        base_idx = cmpOffset[warp] + rate_ofs;
+    }
+
     __syncthreads();
 
-    uint32_t prev_thread = __shfl_up_sync(0xffffffff, thread_ofs, 1);
-    uint32_t cmp_byte_ofs;
-    if(!lane) cmp_byte_ofs = base_idx;
-    else cmp_byte_ofs = base_idx + prev_thread / 8;
+    uint32_t cmp_byte_ofs = base_idx;
+
+    if (lane != 0) {
+        const uint32_t prev_thread = __shfl_up_sync(0xffffffff, thread_ofs, 1);
+        cmp_byte_ofs += prev_thread / 8;
+    }
 
     return cmp_byte_ofs;
 }
+
+
+//------------------------------------------------------------------------------
+// Compression Kernel
 
 __global__ void SZplus_compress_kernel_f32(
     const float* const __restrict__ oriData,
@@ -82,124 +144,69 @@ __global__ void SZplus_compress_kernel_f32(
     const float eb,
     const size_t nbEle)
 {
-    __shared__ uint32_t base_idx;
-
     const int tid = threadIdx.x;
     const int idx = blockIdx.x * blockDim.x + tid;
-    const int lane = idx & 31;
-    const int warp = idx >> 5;
-    const int block_num = cmp_chunk_f32/32;
+    const int block_num = cmp_chunk_f32 / 32;
     const int start_idx = idx * cmp_chunk_f32;
-    const int start_block_idx = start_idx/32;
-    const int rate_ofs = (nbEle+31)/32;
-    const float recipPrecision = 0.5f/eb;
+    const int start_block_idx = start_idx / 32;
+    const int rate_ofs = (nbEle + 31) / 32;
+    const float recipPrecision = __frcp_rn(eb);
 
-    int temp_start_idx, temp_end_idx;
-    int quant_chunk_idx;
-    int block_idx;
-    int currQuant, lorenQuant, prevQuant, maxQuant;
-    int absQuant[cmp_chunk_f32];
-    uint32_t sign_flag[block_num];
-    int sign_ofs;
-    int fixed_rate[block_num];
+    uint32_t absQuant[32];
+    uint32_t fixed_rate[block_num];
     uint32_t thread_ofs = 0;
 
     for(int j = 0; j < block_num; j++)
     {
-        sign_flag[j] = 0;
-        temp_start_idx = start_idx + j*32;
-        temp_end_idx = temp_start_idx + 32;
-        block_idx = start_block_idx+j;
-        prevQuant = 0;
-        maxQuant = 0;
+        int temp_start_idx = start_idx + j * 32;
+        int32_t prevQuant = 0;
+        uint32_t maxQuant = 0;
 
-        for(int i = temp_start_idx; i < temp_end_idx; i++)
+        for(int i = 0; i < 32; i++)
         {
-            quant_chunk_idx = i%cmp_chunk_f32;
             // This is the same quantization used by torch.round()
-            currQuant = __float2int_rn(oriData[i] * recipPrecision);
-            lorenQuant = currQuant - prevQuant;
+            const int32_t currQuant = __float2int_rn(oriData[temp_start_idx + i] * recipPrecision);
+            const int32_t lorenQuant = currQuant - prevQuant;
             prevQuant = currQuant;
-            sign_ofs = i % 32;
-            sign_flag[j] |= (lorenQuant < 0) << (31 - sign_ofs);
-            absQuant[quant_chunk_idx] = abs(lorenQuant);
-            maxQuant = maxQuant > absQuant[quant_chunk_idx] ? maxQuant : absQuant[quant_chunk_idx];
+
+            const uint32_t zigQuant = zigzag_encode(lorenQuant);
+
+            absQuant[i] = zigQuant;
+            maxQuant = maxQuant > zigQuant ? maxQuant : zigQuant;
         }
 
-        fixed_rate[j] = get_bit_num(maxQuant);
-        thread_ofs += (fixed_rate[j]) ? (32+fixed_rate[j]*32) : 0;
-        if(block_idx<rate_ofs) cmpData[block_idx] = (uint8_t)fixed_rate[j];
+        const uint32_t rate = bit_count(maxQuant);
+        fixed_rate[j] = rate;
+        thread_ofs += rate != 0 ? rate*32 : 0;
+
+        // FIXME: Why does this happen?
+        if (start_block_idx + j < rate_ofs) {
+            cmpData[start_block_idx + j] = (uint8_t)rate;
+        }
     }
 
     uint32_t cmp_byte_ofs = sync_offsets(thread_ofs, cmpOffset, flag, nbEle);
 
-    for(int j=0; j<block_num; j++)  
+    for (int j = 0; j < block_num; j++)
     {
-        int chunk_idx_start = j*32;
+        int chunk_idx_start = j * 32;
         int rate = fixed_rate[j];
 
-        if(rate != 0)
+        if (rate != 0)
         {
-            cmpData[cmp_byte_ofs++] = 0xff & (sign_flag[j] >> 24);
-            cmpData[cmp_byte_ofs++] = 0xff & (sign_flag[j] >> 16);
-            cmpData[cmp_byte_ofs++] = 0xff & (sign_flag[j] >> 8);
-            cmpData[cmp_byte_ofs++] = 0xff & sign_flag[j];
+            const int written_bytes = pack_block_bits(
+                absQuant + chunk_idx_start,
+                cmpData + cmp_byte_ofs,
+                rate);
 
-            uint8_t tmp_char0, tmp_char1, tmp_char2, tmp_char3;
-            int mask = 1;
-            for(int i=0; i<rate; i++)
-            {
-                tmp_char0 = 0;
-                tmp_char1 = 0;
-                tmp_char2 = 0;
-                tmp_char3 = 0;
-
-                tmp_char0 = (((absQuant[chunk_idx_start+0] & mask) >> i) << 7) |
-                            (((absQuant[chunk_idx_start+1] & mask) >> i) << 6) |
-                            (((absQuant[chunk_idx_start+2] & mask) >> i) << 5) |
-                            (((absQuant[chunk_idx_start+3] & mask) >> i) << 4) |
-                            (((absQuant[chunk_idx_start+4] & mask) >> i) << 3) |
-                            (((absQuant[chunk_idx_start+5] & mask) >> i) << 2) |
-                            (((absQuant[chunk_idx_start+6] & mask) >> i) << 1) |
-                            (((absQuant[chunk_idx_start+7] & mask) >> i) << 0);
-
-                tmp_char1 = (((absQuant[chunk_idx_start+8] & mask) >> i) << 7) |
-                            (((absQuant[chunk_idx_start+9] & mask) >> i) << 6) |
-                            (((absQuant[chunk_idx_start+10] & mask) >> i) << 5) |
-                            (((absQuant[chunk_idx_start+11] & mask) >> i) << 4) |
-                            (((absQuant[chunk_idx_start+12] & mask) >> i) << 3) |
-                            (((absQuant[chunk_idx_start+13] & mask) >> i) << 2) |
-                            (((absQuant[chunk_idx_start+14] & mask) >> i) << 1) |
-                            (((absQuant[chunk_idx_start+15] & mask) >> i) << 0);
-
-                tmp_char2 = (((absQuant[chunk_idx_start+16] & mask) >> i) << 7) |
-                            (((absQuant[chunk_idx_start+17] & mask) >> i) << 6) |
-                            (((absQuant[chunk_idx_start+18] & mask) >> i) << 5) |
-                            (((absQuant[chunk_idx_start+19] & mask) >> i) << 4) |
-                            (((absQuant[chunk_idx_start+20] & mask) >> i) << 3) |
-                            (((absQuant[chunk_idx_start+21] & mask) >> i) << 2) |
-                            (((absQuant[chunk_idx_start+22] & mask) >> i) << 1) |
-                            (((absQuant[chunk_idx_start+23] & mask) >> i) << 0);
-                
-                tmp_char3 = (((absQuant[chunk_idx_start+24] & mask) >> i) << 7) |
-                            (((absQuant[chunk_idx_start+25] & mask) >> i) << 6) |
-                            (((absQuant[chunk_idx_start+26] & mask) >> i) << 5) |
-                            (((absQuant[chunk_idx_start+27] & mask) >> i) << 4) |
-                            (((absQuant[chunk_idx_start+28] & mask) >> i) << 3) |
-                            (((absQuant[chunk_idx_start+29] & mask) >> i) << 2) |
-                            (((absQuant[chunk_idx_start+30] & mask) >> i) << 1) |
-                            (((absQuant[chunk_idx_start+31] & mask) >> i) << 0);
-
-                // Move data to global memory.
-                cmpData[cmp_byte_ofs++] = tmp_char0;
-                cmpData[cmp_byte_ofs++] = tmp_char1;
-                cmpData[cmp_byte_ofs++] = tmp_char2;
-                cmpData[cmp_byte_ofs++] = tmp_char3;
-                mask <<= 1;
-            }
+            cmp_byte_ofs += written_bytes;
         }
     }
 }
+
+
+//------------------------------------------------------------------------------
+// Decompression Kernel
 
 __global__ void SZplus_decompress_kernel_f32(
     float* const __restrict__ decData,
@@ -209,49 +216,37 @@ __global__ void SZplus_decompress_kernel_f32(
     const float eb,
     const size_t nbEle)
 {
-    __shared__ uint32_t base_idx;
-
     const int tid = threadIdx.x;
     const int idx = blockIdx.x * blockDim.x + tid;
-    const int lane = idx & 31;
-    const int warp = idx >> 5;
     const int block_num = dec_chunk_f32/32;
     const int start_idx = idx * dec_chunk_f32;
     const int start_block_idx = start_idx/32;
     const int rate_ofs = (nbEle+31)/32;
 
-    int temp_start_idx;
-    int block_idx;
-    int absQuant[32];
-    int currQuant, lorenQuant, prevQuant;
-    int sign_ofs;
+    uint32_t absQuant[32];
     int fixed_rate[block_num];
     uint32_t thread_ofs = 0;
 
-    for(int j=0; j<block_num; j++)
+    for (int j = 0; j < block_num; j++)
     {
-        block_idx = start_block_idx + j;
-        if(block_idx<rate_ofs) 
+        const int block_idx = start_block_idx + j;
+        if (block_idx < rate_ofs)
         {
-            fixed_rate[j] = (int)cmpData[block_idx];
-            thread_ofs += (fixed_rate[j]) ? (32+fixed_rate[j]*32) : 0;
+            const int rate = (int)cmpData[block_idx];
+            fixed_rate[j] = rate;
+            thread_ofs += rate != 0 ? (32 + rate * 32) : 0; 
         }
     }
 
     uint32_t cmp_byte_ofs = sync_offsets(thread_ofs, cmpOffset, flag, nbEle);
 
-    for(int j=0; j<block_num; j++)
+    for (int j = 0; j < block_num; j++)
     {
-        temp_start_idx = start_idx + j*32;
-        uint32_t sign_flag = 0;
+        const int temp_start_idx = start_idx + j*32;
+        const int rate = fixed_rate[j];
 
-        if(fixed_rate[j])
+        if (rate)
         {
-            sign_flag = (0xff000000 & (cmpData[cmp_byte_ofs++] << 24)) |
-                        (0x00ff0000 & (cmpData[cmp_byte_ofs++] << 16)) |
-                        (0x0000ff00 & (cmpData[cmp_byte_ofs++] << 8))  |
-                        (0x000000ff & cmpData[cmp_byte_ofs++]);
-            
             uint8_t tmp_char0, tmp_char1, tmp_char2, tmp_char3;
             for(int i=0; i<32; i++) absQuant[i] = 0;
             for(int i=0; i<fixed_rate[j]; i++)
@@ -297,28 +292,26 @@ __global__ void SZplus_decompress_kernel_f32(
                 absQuant[30] |= ((tmp_char3 >> 1) & 0x00000001) << i;
                 absQuant[31] |= ((tmp_char3 >> 0) & 0x00000001) << i;
             }
-            prevQuant = 0;
-            for(int i=0; i<32; i++)
+
+            int32_t prevQuant = 0;
+            for (int i = 0; i < 32; i++)
             {
-                sign_ofs = i % 32;
-                if(sign_flag & (1 << (31 - sign_ofs)))
-                    lorenQuant = absQuant[i] * -1;
-                else
-                    lorenQuant = absQuant[i];
-                currQuant = (lorenQuant + prevQuant) * 2;
-                decData[temp_start_idx+i] = currQuant * eb;
+                int32_t currQuant = zigzag_decode(absQuant[i]) + prevQuant;
+                decData[temp_start_idx + i] = currQuant * eb;
                 prevQuant = currQuant;
             }
         } else {
-            for(int i=0; i<32; i++)
+            for(int i = 0; i < 32; i++)
             {
-                decData[temp_start_idx+i] = 0.f;
+                decData[temp_start_idx + i] = 0.f;
             }
         }
     }
-
-    printf("cmp_byte_ofs = %d\n", (int)cmp_byte_ofs);
 }
+
+
+//------------------------------------------------------------------------------
+// API
 
 int SZplus_compress_hostptr_f32(
     float* oriData,
@@ -376,7 +369,6 @@ int SZplus_compress_hostptr_f32(
     cudaDeviceSynchronize();
 
     // Obtain compression ratio and move data back to CPU.  
-    printf("nbEle % 32 = %d\n", (int)(nbEle % 32));
     *cmpSize = (size_t)d_cmpOffset[cmpOffSize-1] + (nbEle+31)/32;
     cudaMemcpy(cmpBytes, d_cmpData, *cmpSize, cudaMemcpyDeviceToHost);
 
