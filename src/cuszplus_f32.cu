@@ -54,8 +54,6 @@ __device__ inline int pack_block_bits(
 
 __device__ uint32_t sync_offsets(
     uint32_t thread_ofs,
-    volatile uint32_t* const __restrict__ cmpOffset,
-    volatile int* const __restrict__ flag,
     const size_t nbEle
 )
 {
@@ -63,33 +61,27 @@ __device__ uint32_t sync_offsets(
 
     const int tid = threadIdx.x;
     const int idx = blockIdx.x * blockDim.x + tid;
-    const int lane = idx & 31;
-    const int warp = idx >> 5;
+    const int lane = idx & 31; // Position of thread within its warp
+    const int warp = idx >> 5; // Group of 32 threads (CUDA execution unit)
     const int rate_ofs = (nbEle + 31) / 32;
 
     __syncthreads();
 
+    // thread_ofs = prefix sum(all lower-numbered lanes)
     for (int i = 1; i < 32; i <<= 1) {
-        int tmp = __shfl_up_sync(0xffffffff, thread_ofs, i);
+        // Read value from lower lane
+        uint32_t sum = __shfl_up_sync(0xffffffff/* all threads participate */, thread_ofs, i/* how many lanes to read from */);
         if (lane >= i) {
-            thread_ofs += tmp;
+            thread_ofs += sum;
         }
     }
 
     __syncthreads();
 
     if (lane == 31) {
+        // Round up to nearest multiple of 8
         cmpOffset[warp + 1] = (thread_ofs + 7) / 8;
-
-        __threadfence();
-
-        if (warp == 0) {
-            flag[1] = 2;
-        } else {
-            flag[warp + 1] = 1;
-        }
-
-        __threadfence();
+        flag[warp + 1] = (warp == 0) ? 2 : 1;
     }
 
     __syncthreads();
@@ -365,10 +357,11 @@ int SZplus_compress_hostptr_f32(
     // cuSZp GPU compression.
     dim3 blockSize(bsize);
     dim3 gridSize(gsize);
-    SZplus_compress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(d_oriData, d_cmpData, d_cmpOffset, d_flag, errorBound, nbEle);
+    const int sharedMemSize = bsize * gsize * sizeof(uint32_t);
+    SZplus_compress_kernel_f32<<<gridSize, blockSize, sharedMemSize, stream>>>(d_oriData, d_cmpData, d_cmpOffset, d_flag, errorBound, nbEle);
     cudaDeviceSynchronize();
 
-    // Obtain compression ratio and move data back to CPU.  
+    // Obtain compression ratio and move data back to CPU.
     *cmpSize = (size_t)d_cmpOffset[cmpOffSize-1] + (nbEle+31)/32;
     cudaMemcpy(cmpBytes, d_cmpData, *cmpSize, cudaMemcpyDeviceToHost);
 

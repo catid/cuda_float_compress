@@ -20,24 +20,11 @@ else()
     set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -g -O2 -march=native")
 endif()
 
-if(CMAKE_CUDA_COMPILER)
-    set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} -g -O2")
-endif()
-
 # For pybind11 to work on Linux.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-find_package(CUDAToolkit REQUIRED)
-
-set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
-set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-set(CMAKE_CUDA_STANDARD "17")
-set(CMAKE_CUDA_FLAGS_INIT "-std=c++17 -allow-unsupported-compiler")
-set(CMAKE_CUDA_ARCHITECTURES 60 61 62 70 75 80 86)
-set(CUDA_PROPAGATE_HOST_FLAGS ON)
 
 # Dependencies
 set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -73,6 +60,17 @@ if(NOT TARGET torch_library)
 endif()
 
 add_subdirectory(pybind11)
+
+# Configure CUDA after finding Torch to avoid conflicts
+find_package(CUDAToolkit REQUIRED)
+set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
+set(CMAKE_CUDA_STANDARD "17")
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+set(CUDA_PROPAGATE_HOST_FLAGS ON)
+set(CMAKE_CUDA_FLAGS_INIT "-std=c++17 -allow-unsupported-compiler")
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} -g -O2")
+set(CMAKE_CUDA_ARCHITECTURES all-major)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xptxas -Werror -Xptxas --warn-on-spills")
 
 pybind11_add_module(cuda_float_compress
     src/cuda_float_compress.cpp
