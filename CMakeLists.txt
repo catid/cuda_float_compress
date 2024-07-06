@@ -60,6 +60,7 @@ if(NOT TARGET torch_library)
 endif()
 
 add_subdirectory(pybind11)
+add_subdirectory(zstd/build/cmake)
 
 # Configure CUDA after finding Torch to avoid conflicts
 find_package(CUDAToolkit REQUIRED)
@@ -88,6 +89,7 @@ target_link_libraries(cuda_float_compress PRIVATE
     Threads::Threads
     pybind11::module
     CUDA::cudart
+    libzstd_static
 )
 set_target_properties(cuda_float_compress PROPERTIES PREFIX "") # remove lib prefix
 

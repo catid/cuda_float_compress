@@ -1,24 +1,39 @@
 #pragma once
 
-#include <cuda_runtime.h>
-
 #include <cstdint>
+#include <vector>
 
-struct FloatCompressor
-{
-    
+
+//------------------------------------------------------------------------------
+// FloatCompressor
+
+struct FloatCompressor {
+    bool Compress(
+        const float* float_data,
+        int float_count,
+        float epsilon = 0.0001f);
+
+    // Result of Compress()
+    std::vector<uint8_t> Result;
+
+    int GetCompressedBytes() const {
+        return static_cast<int>( Result.size() );
+    }
 };
 
-// Returns 0 if successful, otherwise returns error code.
-int SZplus_compress_hostptr_f32(
-    float* original_data,
-    uint8_t* cmpBytes,
-    size_t nbEle,
-    size_t* cmpSize,
-    float errorBound);
-int SZplus_decompress_hostptr_f32(
-    float* decData,
-    uint8_t* cmpBytes,
-    size_t nbEle,
-    size_t cmpSize,
-    float errorBound);
+
+//------------------------------------------------------------------------------
+// FloatDecompressor
+
+struct FloatDecompressor {
+    bool Decompress(
+        const void* compressed_data,
+        int compressed_bytes);
+
+    // Result of Decompress()
+    std::vector<float> Result;
+
+    int GetFloatCount() const {
+        return static_cast<int>( Result.size() );
+    }
+};

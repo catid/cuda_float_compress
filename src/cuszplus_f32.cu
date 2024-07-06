@@ -1,6 +1,19 @@
 #include "cuszplus_f32.h"
 
+#include <zstd.h>
+
+#include <cuda_runtime.h>
 #include <cub/cub.cuh> // CUB from CUDA Toolkit
+
+// FIXME: REMOVE THIS
+#include <stdio.h>
+
+//------------------------------------------------------------------------------
+// Constants
+
+static const int kZstdCompressionLevel = 1;
+static const uint32_t kMagic = 0xCA7DD007;
+static const int kHeaderBytes = 8;
 
 #define BLOCK_SIZE 256
 #define QUANT_GROUP_SIZE 32
@@ -10,8 +23,99 @@
 #define BLOCK_PARAM_COUNT (BLOCK_SIZE * THREAD_GROUP_COUNT)
 #define PARAM_SIZE (4 + 1 + 1)
 
-// FIXME: REMOVE THIS
-#include <stdio.h>
+/*
+    Header:
+        kMagic(4 bytes)
+        FloatCount(4 bytes)
+        Block 0 used words(4 bytes)
+        Block 1 used words(4 bytes)
+        ...
+        Block N used words(4 bytes)
+
+    Followed by each block:
+        MaxIndex(1 byte) x BLOCK_PARAM_COUNT
+        Bits(1 byte) x BLOCK_PARAM_COUNT
+        HighBits(4 bytes) x BLOCK_PARAM_COUNT
+        <Compressed Floats>
+            Quantization Group 0(QUANT_GROUP_SIZE * Bits_0 / 8 bytes)
+            Quantization Group 1(QUANT_GROUP_SIZE * Bits_1 / 8 bytes)
+            ...
+            Quantization Group i(QUANT_GROUP_SIZE * Bits_i / 8 bytes)
+
+    Compression Algorithm:
+        First quantize (int32_t) each float by dividing by epsilon:
+            X[i] = Torch.Round( Float[i] / epsilon )
+
+        Within each GPU thread, subtract consective floats
+        for sets of THREAD_GROUP_COUNT * QUANT_GROUP_SIZE floats:
+            X[i] = X[i] - X[i - 1]
+
+        Zig-zag encoding: (x << 1) ^ (x >> 31)
+        This puts the sign bit in the least significant bit, so that
+        each quantized value becomes an unsigned integer.
+            X[i] = ZigZagEncode( X[i] )
+
+        Find the two largest values in each QUANT_GROUP_SIZE.
+            X_max = Max(X[i]), X_max2 = SecondLargest(X[i])
+
+        Get the number of bits required to represent X_max2.
+            Bits = BitCount(X_max2)
+
+        Store index of X_max and the high bits (X_max >> Bits) and the
+        number of Bits in a table, for use in decompression.
+
+        Interleave Bits from sets of quantized values.
+        So every 32 bits of output corresponds to one vertical column of bits
+        from QUANT_GROUP_SIZE quantized values.
+        These values are packed together for each block of BLOCK_SIZE threads
+        using synchronization between threads in the block.
+
+    The above algorithm runs on GPU massively in parallel.
+    This prepares the data for further compression on CPU using Zstd. 
+    The result of GPU compression is a set of disjoint blocks.
+    Each block is compressed using ZSTD_compressStream as if they were
+    contiguous in memory rather than disjoint blocks.
+
+    The header includes all the information needed to decompress the data.
+
+
+    Decompression Algorithm:
+
+    We decompress the data into a large contiguous buffer that is shared
+    with the GPU.  On GPU:
+
+        For each quantization group:
+            Unpack the quantized values from the bit packing.
+
+            Restore the largest value from the table.
+
+            X[i] = ZigZagDecode( X[i] ), now a 32-bit signed integer.
+
+            X[i] = X[i] + X[i - 1]
+
+            X[i] = X[i] * epsilon
+*/
+
+
+//------------------------------------------------------------------------------
+// Serialization
+
+inline void write_uint32_le(void* buffer, uint32_t value) {
+    uint8_t* ptr = static_cast<uint8_t*>(buffer);
+    ptr[0] = static_cast<uint8_t>(value);
+    ptr[1] = static_cast<uint8_t>(value >> 8);
+    ptr[2] = static_cast<uint8_t>(value >> 16);
+    ptr[3] = static_cast<uint8_t>(value >> 24);
+}
+
+inline uint32_t read_uint32_le(const void* buffer) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(buffer);
+    return static_cast<uint32_t>(ptr[0]) |
+           (static_cast<uint32_t>(ptr[1]) << 8) |
+           (static_cast<uint32_t>(ptr[2]) << 16) |
+           (static_cast<uint32_t>(ptr[3]) << 24);
+}
+
 
 //------------------------------------------------------------------------------
 // Tools
@@ -58,8 +162,8 @@ __device__ inline uint32_t pack_bits(
 
 __global__ void SZplus_compress_kernel_f32(
     const float* const __restrict__ original_data,
-    const size_t original_float_count,
-    const float epsilon,
+    float epsilon,
+    uint32_t* __restrict__ block_used_words,
     uint8_t* __restrict__ compressed_data)
 {
     using BlockScan = cub::BlockScan<uint32_t, BLOCK_SIZE>;
@@ -68,20 +172,13 @@ __global__ void SZplus_compress_kernel_f32(
 
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    /*
-        Block layout:
-            MaxIndex(1 byte) x BLOCK_PARAM_COUNT
-            Bits(1 byte) x BLOCK_PARAM_COUNT
-            HighBits(4 bytes) x BLOCK_PARAM_COUNT
-            QuantGroup(4 bytes) x BLOCK_FLOAT_COUNT
-    */
     compressed_data += blockIdx.x * (BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float));
 
     uint32_t quant_group[THREAD_FLOAT_COUNT];
     uint8_t group_bits[THREAD_GROUP_COUNT];
 
-    uint32_t offset = 0;
-    const float inv_epsilon = __frcp_rn(epsilon);
+    epsilon = 1.0f / epsilon;
+    uint32_t used_words = 0;
     int32_t prev_quant = 0;
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
         uint32_t max_quant = 0, max2_quant = 0;
@@ -89,7 +186,7 @@ __global__ void SZplus_compress_kernel_f32(
 
         for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
             int float_index = thread_idx * THREAD_FLOAT_COUNT + j;
-            float f = original_data[float_index] * inv_epsilon;
+            float f = original_data[float_index] * epsilon;
 
             // This is the same quantization used by torch.round()
             const int32_t quant = __float2int_rn(f);
@@ -114,7 +211,7 @@ __global__ void SZplus_compress_kernel_f32(
         const uint32_t bits = bit_count(max2_quant);
 
         // Increment write count for this quantization group
-        offset += bits * QUANT_GROUP_SIZE / sizeof(uint32_t);
+        used_words += bits * QUANT_GROUP_SIZE / sizeof(uint32_t);
 
         group_bits[i] = static_cast<uint8_t>(bits);
 
@@ -130,12 +227,19 @@ __global__ void SZplus_compress_kernel_f32(
 
     // Inclusive Sum (using CUB)
     BlockScan block_scan(temp_storage);
-    block_scan.InclusiveSum(offset, offset);
+    uint32_t offset = 0;
+    block_scan.ExclusiveSum(used_words, offset);
 
     __syncthreads(); // Barrier for smem reuse
 
-    // Get pointer to compressed words
-    uint32_t* __restrict__ compressed_words = reinterpret_cast<uint32_t*>(compressed_data + BLOCK_PARAM_COUNT * PARAM_SIZE);
+    if (threadIdx.x == blockDim.x - 1) {
+        block_used_words[blockIdx.x] = offset + used_words;
+    }
+
+    // Get pointer to compressed words for this thread
+    compressed_data += BLOCK_PARAM_COUNT * PARAM_SIZE;
+    uint32_t* __restrict__ compressed_words = reinterpret_cast<uint32_t*>(compressed_data);
+    compressed_words += offset;
 
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
         const uint32_t bits = group_bits[i];
@@ -150,6 +254,118 @@ __global__ void SZplus_compress_kernel_f32(
             *compressed_words++ = packed_data;
         }
     }
+}
+
+
+//------------------------------------------------------------------------------
+// FloatCompressor
+
+bool FloatCompressor::Compress(
+    const float* float_data,
+    int float_count,
+    float epsilon)
+{
+    // Copy data to device
+    float* original_data = nullptr;
+    cudaError_t err = cudaMalloc((void**)&original_data, sizeof(float)*float_count);
+    if (err != cudaSuccess) { return -1; }
+    CallbackScope original_data_cleanup([&]() { cudaFree(original_data); });
+    cudaMemcpy(original_data, float_data, sizeof(float)*float_count, cudaMemcpyHostToDevice);
+
+    int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
+    const int block_bytes = BLOCK_PARAM_COUNT*PARAM_SIZE + BLOCK_FLOAT_COUNT*sizeof(float);
+
+    // Create output buffer
+    uint8_t* compressed_blocks = nullptr;
+    cudaError_t err = cudaMallocManaged((void**)&compressed_blocks, block_count*block_bytes + block_count*sizeof(uint32_t));
+    if (err != cudaSuccess) { return -1; }
+    CallbackScope original_data_cleanup([&]() { cudaFree(compressed_blocks); });
+    uint32_t* block_used_words = reinterpret_cast<uint32_t*>(compressed_blocks + block_count*block_bytes);
+
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+    CallbackScope stream_cleanup([&]() { cudaStreamDestroy(stream); });
+
+    dim3 blockSize(BLOCK_SIZE);
+    dim3 gridSize(block_count);
+    SZplus_compress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(
+        original_data,
+        epsilon,
+        block_used_words,
+        compressed_blocks);
+
+    // Initialize zstd
+    auto zcs = ZSTD_createCStream();
+    if (zcs == NULL) { return false; }
+    CallbackScope zcs_cleanup([&]() { ZSTD_freeCStream(zcs); });
+
+    // Initialize the compression stream
+    size_t const initResult = ZSTD_initCStream(zcs, kZstdCompressionLevel);
+    if (ZSTD_isError(initResult)) { return false; }
+
+    Result.resize(block_bytes * block_count);
+    ZSTD_outBuffer output = { Result.data(), Result.size(), 0 };
+
+    cudaDeviceSynchronize();
+
+    {
+        std::vector<uint8_t> header_buffer(kHeaderBytes + block_count*sizeof(uint32_t));
+        write_uint32_le(header_buffer.data(), kMagic);
+        write_uint32_le(header_buffer.data() + 4, float_count);
+        uint32_t* words = reinterpret_cast<uint32_t*>(header_buffer.data() + kHeaderBytes);
+        for (int i = 0; i < block_count; i++) {
+            words[i] = block_used_words[i];
+        }
+
+        ZSTD_inBuffer input = { header_buffer.data(), header_buffer.size(), 0 };
+
+        while (input.pos < input.size) {
+            size_t const compressResult = ZSTD_compressStream(zcs, &output, &input);
+            if (ZSTD_isError(compressResult)) { return false; }
+
+            if (output.pos == output.size) {
+                return false;
+            }
+        }
+    }
+
+    for (int i = 0; i < block_count; i++)
+    {
+        const uint32_t used_words = block_used_words[i];
+        const uint8_t* block_data = compressed_blocks + block_bytes * i;
+        const uint32_t block_used_bytes = BLOCK_PARAM_COUNT * PARAM_SIZE + used_words * 4;
+
+        ZSTD_inBuffer input = { block_data, block_used_bytes, 0 };
+
+        while (input.pos < input.size) {
+            size_t const compressResult = ZSTD_compressStream(zcs, &output, &input);
+            if (ZSTD_isError(compressResult)) { return false; }
+
+            if (output.pos == output.size) {
+                return false;
+            }
+        }
+    }
+
+    // Flush the zstd stream
+    size_t remainingToFlush;
+    for (;;) {
+        remainingToFlush = ZSTD_endStream(zcs, &output);
+        if (ZSTD_isError(remainingToFlush)) { return false; }
+
+        if (remainingToFlush <= 0) {
+            break;
+        }
+
+        if (output.pos == output.size) {
+            return false;
+        }
+    }
+
+    // Resize the result vector to the actual compressed size
+    Result.resize(output.pos);
+
+    return true;
 }
 
 
@@ -259,190 +475,11 @@ __global__ void SZplus_decompress_kernel_f32(
 
 
 //------------------------------------------------------------------------------
-// API
+// FloatDecompressor
 
-int SZplus_compress_hostptr_f32(
-    float* oriData,
-    uint8_t* cmpBytes,
-    size_t nbEle,
-    size_t* cmpSize,
-    float errorBound)
+bool FloatDecompressor::Decompress(
+    const void* compressed_data,
+    int compressed_bytes)
 {
-    int block_count = (nbEle + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
-
-    // Copy data to device
-    float* original_data = nullptr;
-    cudaError_t err = cudaMalloc((void**)&original_data, sizeof(float)*nbEle);
-    if (err != cudaSuccess) { return -1; }
-    CallbackScope original_data_cleanup([&]() { cudaFree(original_data); });
-    cudaMemcpy(original_data, oriData, sizeof(float)*nbEle, cudaMemcpyHostToDevice);
-
-    err = cudaMalloc((void**)&d_cmpData, sizeof(float)*pad_nbEle);
-    if (err != cudaSuccess) { return -1; }
-
-    err = cudaMallocManaged((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
-    if (err != cudaSuccess) { return -1; }
-
-    cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
-    err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
-    if (err != cudaSuccess) { return -1; }
-
-    cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
-    cudaMemset(d_oriData + nbEle, 0, (pad_nbEle - nbEle) * sizeof(float));
-
-    // Initializing CUDA Stream.
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    // cuSZp GPU compression.
-    dim3 blockSize(BLOCK_SIZE);
-    dim3 gridSize(block_count);
-    SZplus_compress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(d_oriData, d_cmpData, d_cmpOffset, d_flag, errorBound, nbEle);
-    cudaDeviceSynchronize();
-
-    // Obtain compression ratio and move data back to CPU.
-    *cmpSize = (size_t)d_cmpOffset[cmpOffSize-1] + (nbEle+31)/32;
-    cudaMemcpy(cmpBytes, d_cmpData, *cmpSize, cudaMemcpyDeviceToHost);
-
-    // Free memory that is used.
-    cudaFree(d_oriData);
-    cudaFree(d_cmpData);
-    cudaFree(d_cmpOffset);
-    cudaFree(d_flag);
-    cudaStreamDestroy(stream);
-
-    return 0;
-}
-
-int SZplus_decompress_hostptr_f32(
-    float* decData,
-    uint8_t* cmpBytes,
-    size_t nbEle,
-    size_t cmpSize,
-    float errorBound)
-{
-    // Data blocking.
-    int bsize = dec_tblock_size_f32;
-    int gsize = (nbEle + bsize * dec_chunk_f32 - 1) / (bsize * dec_chunk_f32);
-    int cmpOffSize = gsize + 1;
-    int pad_nbEle = gsize * bsize * dec_chunk_f32;
-
-    // Initializing global memory for GPU compression.
-    float* d_decData = NULL;
-    uint8_t* d_cmpData = NULL;
-    uint32_t* d_cmpOffset = NULL;
-    int* d_flag = NULL;
-    cudaError_t err = cudaMalloc((void**)&d_decData, sizeof(float)*pad_nbEle);
-    if (err != cudaSuccess) { return -1; }
-    //cudaMemset(d_decData, 0, sizeof(float)*pad_nbEle);
-    err = cudaMalloc((void**)&d_cmpData, sizeof(float)*pad_nbEle);
-    if (err != cudaSuccess) { return -1; }
-    cudaMemcpy(d_cmpData, cmpBytes, cmpSize, cudaMemcpyHostToDevice);
-    err = cudaMalloc((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
-    if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
-    err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
-    if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
-
-    // Initializing CUDA Stream.
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    // cuSZp GPU compression.
-    dim3 blockSize(bsize);
-    dim3 gridSize(gsize);
-    printf("gridSize.x: %d\n", gridSize.x);
-    printf("blockSize.x: %d\n", blockSize.x);
-    SZplus_decompress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(d_decData, d_cmpData, d_cmpOffset, d_flag, errorBound, nbEle);
-    cudaDeviceSynchronize();
-
-    // Move data back to CPU.
-    cudaMemcpy(decData, d_decData, sizeof(float)*nbEle, cudaMemcpyDeviceToHost);
-
-    // Free memoy that is used.
-    cudaFree(d_decData);
-    cudaFree(d_cmpData);
-    cudaFree(d_cmpOffset);
-    cudaFree(d_flag);
-    cudaStreamDestroy(stream);
-
-    return 0;
-}
-
-int SZplus_compress_deviceptr_f32(
-    float* d_oriData,
-    uint8_t* d_cmpBytes,
-    size_t nbEle,
-    size_t* cmpSize,
-    float errorBound,
-    cudaStream_t stream)
-{
-    // Data blocking.
-    int bsize = cmp_tblock_size_f32;
-    int gsize = (nbEle + bsize * cmp_chunk_f32 - 1) / (bsize * cmp_chunk_f32);
-    int cmpOffSize = gsize + 1;
-    int pad_nbEle = gsize * bsize * cmp_chunk_f32;
-
-    // Initializing global memory for GPU compression.
-    uint32_t* d_cmpOffset = NULL;
-    int* d_flag = NULL;
-    cudaError_t err = cudaMallocManaged((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
-    if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
-    err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
-    if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
-    cudaMemset(d_oriData + nbEle, 0, (pad_nbEle - nbEle) * sizeof(float));
-
-    // cuSZp GPU compression.
-    dim3 blockSize(bsize);
-    dim3 gridSize(gsize);
-    SZplus_compress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(d_oriData, d_cmpBytes, d_cmpOffset, d_flag, errorBound, nbEle);
-    cudaDeviceSynchronize();
-
-    // Obtain compression ratio and move data back to CPU.  
-    *cmpSize = (size_t)d_cmpOffset[cmpOffSize-1] + (nbEle+31)/32;
-
-    // Free memory that is used.
-    cudaFree(d_cmpOffset);
-    cudaFree(d_flag);
-
-    return 0;
-}
-
-int SZplus_decompress_deviceptr_f32(
-    float* d_decData,
-    uint8_t* d_cmpBytes,
-    size_t nbEle,
-    size_t cmpSize,
-    float errorBound,
-    cudaStream_t stream)
-{
-    // Data blocking.
-    int bsize = dec_tblock_size_f32;
-    int gsize = (nbEle + bsize * dec_chunk_f32 - 1) / (bsize * dec_chunk_f32);
-    int cmpOffSize = gsize + 1;
-
-    // Initializing global memory for GPU compression.
-    uint32_t* d_cmpOffset = NULL;
-    int* d_flag = NULL;
-    cudaError_t err = cudaMalloc((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
-    if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
-    err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
-    if (err != cudaSuccess) { return -1; }
-    cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
-
-    // cuSZp GPU compression.
-    dim3 blockSize(bsize);
-    dim3 gridSize(gsize);
-    SZplus_decompress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(d_decData, d_cmpBytes, d_cmpOffset, d_flag, errorBound, nbEle);
-    cudaDeviceSynchronize();
-
-    // Free memoy that is used.
-    cudaFree(d_cmpOffset);
-    cudaFree(d_flag);
-
-    return 0;
+    
 }
