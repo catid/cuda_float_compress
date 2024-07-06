@@ -1,10 +1,26 @@
 #include "cuszplus_f32.h"
 
+#include <cub/cub.cuh> // CUB from CUDA Toolkit
+
+#define BLOCK_SIZE 256
+#define QUANT_GROUP_SIZE 32
+#define THREAD_GROUP_COUNT 4
+#define THREAD_FLOAT_COUNT (THREAD_GROUP_COUNT * QUANT_GROUP_SIZE)
+#define BLOCK_FLOAT_COUNT (BLOCK_SIZE * THREAD_FLOAT_COUNT)
+#define BLOCK_PARAM_COUNT (BLOCK_SIZE * THREAD_GROUP_COUNT)
+#define PARAM_SIZE (4 + 1 + 1)
+
 // FIXME: REMOVE THIS
 #include <stdio.h>
 
 //------------------------------------------------------------------------------
 // Tools
+
+struct CallbackScope {
+    CallbackScope(std::function<void()> func) : func(func) {}
+    ~CallbackScope() { func(); }
+    std::function<void()> func;
+};
 
 __device__ inline uint32_t bit_count(uint32_t x)
 {
@@ -21,107 +37,19 @@ __device__ inline int32_t zigzag_decode(uint32_t x)
     return (x >> 1) ^ -(x & 1);
 }
 
-__device__ inline uint32_t pack_bits(const uint32_t* absQuant, int bit_pos) {
+__device__ inline uint32_t pack_bits(
+    const uint32_t* const __restrict__ quant_group,
+    uint32_t bit_pos)
+{
     uint8_t result = 0;
     uint32_t mask = 1U << bit_pos;
+
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        result |= ((absQuant[j] & mask) != 0) << (7 - j);
+    for (uint32_t j = 0; j < 8; ++j) {
+        result |= ((quant_group[j] & mask) != 0) << (7 - j);
     }
+
     return result;
-}
-
-// Returns number of bytes written
-__device__ inline int pack_block_bits(
-    const uint32_t* absQuant,
-    uint8_t* cmpData,
-    int rate
-) {
-    for (int i = 0; i < rate; i++) {
-        int offset = i * sizeof(uint32_t);
-        const uint32_t packed_data = 
-            pack_bits(absQuant + offset,      i) |
-            pack_bits(absQuant + offset + 8,  i) << 8  |
-            pack_bits(absQuant + offset + 16, i) << 16 |
-            pack_bits(absQuant + offset + 24, i) << 24;
-
-        // Safe unaligned store
-        __stcg(cmpData + offset, packed_data);
-    }
-
-    return rate * sizeof(uint32_t);
-}
-
-__device__ uint32_t sync_offsets(
-    uint32_t thread_ofs,
-    const size_t nbEle
-)
-{
-    __shared__ uint32_t base_idx;
-
-    const int tid = threadIdx.x;
-    const int idx = blockIdx.x * blockDim.x + tid;
-    const int lane = idx & 31; // Position of thread within its warp
-    const int warp = idx >> 5; // Group of 32 threads (CUDA execution unit)
-    const int rate_ofs = (nbEle + 31) / 32;
-
-    __syncthreads();
-
-    // thread_ofs = prefix sum(all lower-numbered lanes)
-    for (int i = 1; i < 32; i <<= 1) {
-        // Read value from lower lane
-        uint32_t sum = __shfl_up_sync(0xffffffff/* all threads participate */, thread_ofs, i/* how many lanes to read from */);
-        if (lane >= i) {
-            thread_ofs += sum;
-        }
-    }
-
-    __syncthreads();
-
-    if (lane == 31) {
-        // Round up to nearest multiple of 8
-        cmpOffset[warp + 1] = (thread_ofs + 7) / 8;
-        flag[warp + 1] = (warp == 0) ? 2 : 1;
-    }
-
-    __syncthreads();
-
-    if (warp > 0 && lane == 0)
-    {
-        int temp_flag = 1;
-        while (temp_flag != 2) {
-            temp_flag = flag[warp];
-        }
-
-        __threadfence();
-
-        cmpOffset[warp] += cmpOffset[warp - 1];
-
-        if (warp == gridDim.x - 1) {
-            cmpOffset[warp + 1] += cmpOffset[warp];
-        }
-
-        __threadfence();
-
-        flag[warp + 1] = 2;
-    }
-
-    __syncthreads();
-
-    if (lane == 0) {
-        base_idx = cmpOffset[warp] + rate_ofs;
-    }
-
-    __syncthreads();
-
-    uint32_t cmp_byte_ofs = base_idx;
-
-    if (lane != 0) {
-        const uint32_t prev_thread = __shfl_up_sync(0xffffffff, thread_ofs, 1);
-        cmp_byte_ofs += prev_thread / 8;
-    }
-
-    return cmp_byte_ofs;
 }
 
 
@@ -129,69 +57,97 @@ __device__ uint32_t sync_offsets(
 // Compression Kernel
 
 __global__ void SZplus_compress_kernel_f32(
-    const float* const __restrict__ oriData,
-    uint8_t* const __restrict__ cmpData,
-    volatile uint32_t* const __restrict__ cmpOffset,
-    volatile int* const __restrict__ flag,
-    const float eb,
-    const size_t nbEle)
+    const float* const __restrict__ original_data,
+    const size_t original_float_count,
+    const float epsilon,
+    uint8_t* __restrict__ compressed_data)
 {
-    const int tid = threadIdx.x;
-    const int idx = blockIdx.x * blockDim.x + tid;
-    const int block_num = cmp_chunk_f32 / 32;
-    const int start_idx = idx * cmp_chunk_f32;
-    const int start_block_idx = start_idx / 32;
-    const int rate_ofs = (nbEle + 31) / 32;
-    const float recipPrecision = __frcp_rn(eb);
+    using BlockScan = cub::BlockScan<uint32_t, BLOCK_SIZE>;
+    using BlockAdjacentDifferenceT = cub::BlockAdjacentDifference<int32_t, BLOCK_SIZE>;
+    __shared__ typename BlockScan::TempStorage temp_storage;
 
-    uint32_t absQuant[32];
-    uint32_t fixed_rate[block_num];
-    uint32_t thread_ofs = 0;
+    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    for(int j = 0; j < block_num; j++)
-    {
-        int temp_start_idx = start_idx + j * 32;
-        int32_t prevQuant = 0;
-        uint32_t maxQuant = 0;
+    /*
+        Block layout:
+            MaxIndex(1 byte) x BLOCK_PARAM_COUNT
+            Bits(1 byte) x BLOCK_PARAM_COUNT
+            HighBits(4 bytes) x BLOCK_PARAM_COUNT
+            QuantGroup(4 bytes) x BLOCK_FLOAT_COUNT
+    */
+    compressed_data += blockIdx.x * (BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float));
 
-        for(int i = 0; i < 32; i++)
-        {
+    uint32_t quant_group[THREAD_FLOAT_COUNT];
+    uint8_t group_bits[THREAD_GROUP_COUNT];
+
+    uint32_t offset = 0;
+    const float inv_epsilon = __frcp_rn(epsilon);
+    int32_t prev_quant = 0;
+    for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
+        uint32_t max_quant = 0, max2_quant = 0;
+        uint8_t max_index = 0;
+
+        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
+            int float_index = thread_idx * THREAD_FLOAT_COUNT + j;
+            float f = original_data[float_index] * inv_epsilon;
+
             // This is the same quantization used by torch.round()
-            const int32_t currQuant = __float2int_rn(oriData[temp_start_idx + i] * recipPrecision);
-            const int32_t lorenQuant = currQuant - prevQuant;
-            prevQuant = currQuant;
+            const int32_t quant = __float2int_rn(f);
 
-            const uint32_t zigQuant = zigzag_encode(lorenQuant);
+            const int32_t delta = quant - prev_quant;
+            prev_quant = quant;
 
-            absQuant[i] = zigQuant;
-            maxQuant = maxQuant > zigQuant ? maxQuant : zigQuant;
+            const uint32_t zig_quant = zigzag_encode(delta);
+            quant_group[i * QUANT_GROUP_SIZE + j] = zig_quant;
+
+            // Update max_quant and max2_quant
+            if (zig_quant > max_quant) {
+                max2_quant = max_quant;
+                max_quant = zig_quant;
+                max_index = (uint8_t)j;
+            } else if (zig_quant > max2_quant) {
+                max2_quant = zig_quant;
+            }
         }
 
-        const uint32_t rate = bit_count(maxQuant);
-        fixed_rate[j] = rate;
-        thread_ofs += rate != 0 ? rate*32 : 0;
+        // Number of bits to represent second largest and smaller quantized values
+        const uint32_t bits = bit_count(max2_quant);
 
-        // FIXME: Why does this happen?
-        if (start_block_idx + j < rate_ofs) {
-            cmpData[start_block_idx + j] = (uint8_t)rate;
-        }
+        // Increment write count for this quantization group
+        offset += bits * QUANT_GROUP_SIZE / sizeof(uint32_t);
+
+        group_bits[i] = static_cast<uint8_t>(bits);
+
+        // For each QUANT_GROUP_SIZE, write the number of bits, index of max value, and high bits
+        compressed_data[THREAD_GROUP_COUNT * threadIdx.x + i] = static_cast<uint8_t>(max_index);
+        compressed_data[BLOCK_PARAM_COUNT + THREAD_GROUP_COUNT * threadIdx.x + i] = static_cast<uint8_t>(bits);
+
+        uint32_t* __restrict__ compressed_high_bits = reinterpret_cast<uint32_t*>(compressed_data + BLOCK_PARAM_COUNT * 2);
+        compressed_high_bits[THREAD_GROUP_COUNT * threadIdx.x + i] = max_quant >> bits;
     }
 
-    uint32_t cmp_byte_ofs = sync_offsets(thread_ofs, cmpOffset, flag, nbEle);
+    __syncthreads(); // Barrier for smem reuse
 
-    for (int j = 0; j < block_num; j++)
-    {
-        int chunk_idx_start = j * 32;
-        int rate = fixed_rate[j];
+    // Inclusive Sum (using CUB)
+    BlockScan block_scan(temp_storage);
+    block_scan.InclusiveSum(offset, offset);
 
-        if (rate != 0)
-        {
-            const int written_bytes = pack_block_bits(
-                absQuant + chunk_idx_start,
-                cmpData + cmp_byte_ofs,
-                rate);
+    __syncthreads(); // Barrier for smem reuse
 
-            cmp_byte_ofs += written_bytes;
+    // Get pointer to compressed words
+    uint32_t* __restrict__ compressed_words = reinterpret_cast<uint32_t*>(compressed_data + BLOCK_PARAM_COUNT * PARAM_SIZE);
+
+    for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
+        const uint32_t bits = group_bits[i];
+
+        for (uint32_t j = 0; j < bits; j++) {
+            const uint32_t packed_data =
+                pack_bits(quant_group + i * QUANT_GROUP_SIZE,      j) |
+                pack_bits(quant_group + i * QUANT_GROUP_SIZE + 8,  j) << 8  |
+                pack_bits(quant_group + i * QUANT_GROUP_SIZE + 16, j) << 16 |
+                pack_bits(quant_group + i * QUANT_GROUP_SIZE + 24, j) << 24;
+
+            *compressed_words++ = packed_data;
         }
     }
 }
@@ -312,39 +268,23 @@ int SZplus_compress_hostptr_f32(
     size_t* cmpSize,
     float errorBound)
 {
-    // Data blocking.
-    int bsize = cmp_tblock_size_f32;
-    int gsize = (nbEle + bsize * cmp_chunk_f32 - 1) / (bsize * cmp_chunk_f32);
-    int cmpOffSize = gsize + 1;
-    int pad_nbEle = gsize * bsize * cmp_chunk_f32 * 2;
+    int block_count = (nbEle + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
 
-    // Initializing global memory for GPU compression.
-    float* d_oriData = NULL;
-    uint8_t* d_cmpData = NULL;
-    uint32_t* d_cmpOffset = NULL;
-    int* d_flag = NULL;
-    cudaError_t err = cudaMalloc((void**)&d_oriData, sizeof(float)*pad_nbEle);
-    printf("pad_nbEle: %zu\n", pad_nbEle);
-    printf("d_oriData: %p\n", d_oriData);
-    printf("err = %d\n", err);
-    printf("gsize: %zu\n", gsize);
-    printf("bsize: %zu\n", bsize);
-    printf("cmp_chunk_f32: %zu\n", cmp_chunk_f32);
-    printf("nbEle: %zu\n", nbEle);
+    // Copy data to device
+    float* original_data = nullptr;
+    cudaError_t err = cudaMalloc((void**)&original_data, sizeof(float)*nbEle);
     if (err != cudaSuccess) { return -1; }
+    CallbackScope original_data_cleanup([&]() { cudaFree(original_data); });
+    cudaMemcpy(original_data, oriData, sizeof(float)*nbEle, cudaMemcpyHostToDevice);
 
-    cudaMemcpy(d_oriData, oriData, sizeof(float)*nbEle, cudaMemcpyHostToDevice);
-    printf("pad_nbEle: %zu\n", pad_nbEle);
     err = cudaMalloc((void**)&d_cmpData, sizeof(float)*pad_nbEle);
     if (err != cudaSuccess) { return -1; }
 
-    printf("cmpOffSize: %zu\n", cmpOffSize);
     err = cudaMallocManaged((void**)&d_cmpOffset, sizeof(uint32_t)*cmpOffSize);
     if (err != cudaSuccess) { return -1; }
 
     cudaMemset(d_cmpOffset, 0, sizeof(uint32_t)*cmpOffSize);
     err = cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
-    printf("cmpOffSize: %zu\n", cmpOffSize);
     if (err != cudaSuccess) { return -1; }
 
     cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
@@ -355,18 +295,14 @@ int SZplus_compress_hostptr_f32(
     cudaStreamCreate(&stream);
 
     // cuSZp GPU compression.
-    dim3 blockSize(bsize);
-    dim3 gridSize(gsize);
-    const int sharedMemSize = bsize * gsize * sizeof(uint32_t);
-    SZplus_compress_kernel_f32<<<gridSize, blockSize, sharedMemSize, stream>>>(d_oriData, d_cmpData, d_cmpOffset, d_flag, errorBound, nbEle);
+    dim3 blockSize(BLOCK_SIZE);
+    dim3 gridSize(block_count);
+    SZplus_compress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(d_oriData, d_cmpData, d_cmpOffset, d_flag, errorBound, nbEle);
     cudaDeviceSynchronize();
 
     // Obtain compression ratio and move data back to CPU.
     *cmpSize = (size_t)d_cmpOffset[cmpOffSize-1] + (nbEle+31)/32;
     cudaMemcpy(cmpBytes, d_cmpData, *cmpSize, cudaMemcpyDeviceToHost);
-
-    printf("sizeof(float)*pad_nbEle = %zu\n", sizeof(float)*pad_nbEle);
-    printf("*cmpSize = %d\n", (int)*cmpSize);
 
     // Free memory that is used.
     cudaFree(d_oriData);
