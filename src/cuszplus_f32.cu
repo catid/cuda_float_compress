@@ -14,7 +14,7 @@ using namespace std;
 
 static const int kZstdCompressionLevel = 1;
 static const uint32_t kMagic = 0xCA7DD007;
-static const int kHeaderBytes = 8;
+static const int kHeaderBytes = 4 + 4 + 4;
 
 #define BLOCK_SIZE 256
 #define QUANT_GROUP_SIZE 32
@@ -23,10 +23,12 @@ static const int kHeaderBytes = 8;
 #define BLOCK_FLOAT_COUNT (BLOCK_SIZE * THREAD_FLOAT_COUNT)
 #define BLOCK_PARAM_COUNT (BLOCK_SIZE * THREAD_GROUP_COUNT)
 #define PARAM_SIZE (4 + 1 + 1)
+#define INTERLEAVE_BITS 1
 
 /*
     Header:
         kMagic(4 bytes)
+        Epsilon(4 bytes)
         FloatCount(4 bytes)
         Block 0 used words(4 bytes)
         Block 1 used words(4 bytes)
@@ -139,6 +141,11 @@ static const int kHeaderBytes = 8;
 //------------------------------------------------------------------------------
 // Serialization
 
+union FloatUInt32 {
+    float f;
+    uint32_t u;
+};
+
 inline void write_uint32_le(void* buffer, uint32_t value) {
     uint8_t* ptr = static_cast<uint8_t*>(buffer);
     ptr[0] = static_cast<uint8_t>(value);
@@ -153,6 +160,18 @@ inline uint32_t read_uint32_le(const void* buffer) {
            (static_cast<uint32_t>(ptr[1]) << 8) |
            (static_cast<uint32_t>(ptr[2]) << 16) |
            (static_cast<uint32_t>(ptr[3]) << 24);
+}
+
+inline void write_float_le(void* buffer, float value) {
+    FloatUInt32 conv;
+    conv.f = value;
+    write_uint32_le(buffer, conv.u);
+}
+
+inline float read_float_le(const void* buffer) {
+    FloatUInt32 conv;
+    conv.u = read_uint32_le(buffer);
+    return conv.f;
 }
 
 
@@ -474,8 +493,18 @@ __global__ void SZplus_compress_kernel_f32(
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
         const uint32_t bits = group_bits[i];
 
-        // TBD: Try other interleave kernels
+#if INTERLEAVE_BITS == 1
         interleave_words_1bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+#elif INTERLEAVE_BITS == 2
+        interleave_words_2bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+#elif INTERLEAVE_BITS == 4
+        interleave_words_4bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+#elif INTERLEAVE_BITS == 8
+        interleave_words_8bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+#else
+#error "Invalid INTERLEAVE_BITS value. Must be 1, 2, 4, or 8."
+#endif
+
         compressed_words += bits;
     }
 }
@@ -541,7 +570,8 @@ bool FloatCompressor::Compress(
     {
         std::vector<uint8_t> header_buffer(kHeaderBytes + block_count*sizeof(uint32_t));
         write_uint32_le(header_buffer.data(), kMagic);
-        write_uint32_le(header_buffer.data() + 4, float_count);
+        write_float_le(header_buffer.data() + 4, epsilon);
+        write_uint32_le(header_buffer.data() + 8, float_count);
         uint32_t* words = reinterpret_cast<uint32_t*>(header_buffer.data() + kHeaderBytes);
         for (int i = 0; i < block_count; i++) {
             words[i] = block_used_words[i];
@@ -604,91 +634,54 @@ bool FloatCompressor::Compress(
 __global__ void SZplus_decompress_kernel_f32(
     float* const __restrict__ decompressed_floats,
     const uint8_t* __restrict__ compressed_blocks,
-    volatile uint32_t* const __restrict__ compressed_block_offsets,
-    const float epsilon)
+    const uint32_t* const __restrict__ block_used_words,
+    float epsilon)
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int block_float_start = thread_idx * THREAD_FLOAT_COUNT;
 
-    const uint32_t block_offset = compressed_block_offsets[blockIdx.x];
-    compressed_blocks += block_offset;
+    const uint8_t* block_data = compressed_blocks + blockIdx.x * (BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float));
+    const uint32_t* compressed_words = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * PARAM_SIZE);
 
-    uint32_t absQuant[32];
-    int fixed_rate[block_num];
-    uint32_t thread_ofs = 0;
+    uint32_t quant_group[THREAD_FLOAT_COUNT];
+    int32_t prev_quant = 0;
 
-    for (int j = 0; j < block_num; j++)
-    {
-        const int block_idx = start_block_idx + j;
-        if (block_idx < rate_ofs)
-        {
-            const int rate = (int)cmpData[block_idx];
-            fixed_rate[j] = rate;
-            thread_ofs += rate != 0 ? (32 + rate * 32) : 0; 
-        }
-    }
+    for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
+        const uint8_t max_index = block_data[THREAD_GROUP_COUNT * threadIdx.x + i];
+        const uint8_t bits = block_data[BLOCK_PARAM_COUNT + THREAD_GROUP_COUNT * threadIdx.x + i];
+        const uint32_t* high_bits = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * 2);
+        const uint32_t max_quant = (high_bits[THREAD_GROUP_COUNT * threadIdx.x + i] << bits) | ((1 << bits) - 1);
 
-    uint32_t cmp_byte_ofs = sync_offsets(thread_ofs, cmpOffset, flag, nbEle);
-
-    for (int j = 0; j < block_num; j++)
-    {
-        const int temp_start_idx = start_idx + j*32;
-        const int rate = fixed_rate[j];
-
-        if (rate)
-        {
-            uint8_t tmp_char0, tmp_char1, tmp_char2, tmp_char3;
-            for(int i=0; i<32; i++) absQuant[i] = 0;
-            for(int i=0; i<fixed_rate[j]; i++)
-            {
-                absQuant[0] |= ((tmp_char0 >> 7) & 0x00000001) << i;
-                absQuant[1] |= ((tmp_char0 >> 6) & 0x00000001) << i;
-                absQuant[2] |= ((tmp_char0 >> 5) & 0x00000001) << i;
-                absQuant[3] |= ((tmp_char0 >> 4) & 0x00000001) << i;
-                absQuant[4] |= ((tmp_char0 >> 3) & 0x00000001) << i;
-                absQuant[5] |= ((tmp_char0 >> 2) & 0x00000001) << i;
-                absQuant[6] |= ((tmp_char0 >> 1) & 0x00000001) << i;
-                absQuant[7] |= ((tmp_char0 >> 0) & 0x00000001) << i;
-
-                absQuant[8] |= ((tmp_char1 >> 7) & 0x00000001) << i;
-                absQuant[9] |= ((tmp_char1 >> 6) & 0x00000001) << i;
-                absQuant[10] |= ((tmp_char1 >> 5) & 0x00000001) << i;
-                absQuant[11] |= ((tmp_char1 >> 4) & 0x00000001) << i;
-                absQuant[12] |= ((tmp_char1 >> 3) & 0x00000001) << i;
-                absQuant[13] |= ((tmp_char1 >> 2) & 0x00000001) << i;
-                absQuant[14] |= ((tmp_char1 >> 1) & 0x00000001) << i;
-                absQuant[15] |= ((tmp_char1 >> 0) & 0x00000001) << i;
-
-                absQuant[16] |= ((tmp_char2 >> 7) & 0x00000001) << i;
-                absQuant[17] |= ((tmp_char2 >> 6) & 0x00000001) << i;
-                absQuant[18] |= ((tmp_char2 >> 5) & 0x00000001) << i;
-                absQuant[19] |= ((tmp_char2 >> 4) & 0x00000001) << i;
-                absQuant[20] |= ((tmp_char2 >> 3) & 0x00000001) << i;
-                absQuant[21] |= ((tmp_char2 >> 2) & 0x00000001) << i;
-                absQuant[22] |= ((tmp_char2 >> 1) & 0x00000001) << i;
-                absQuant[23] |= ((tmp_char2 >> 0) & 0x00000001) << i;
-
-                absQuant[24] |= ((tmp_char3 >> 7) & 0x00000001) << i;
-                absQuant[25] |= ((tmp_char3 >> 6) & 0x00000001) << i;
-                absQuant[26] |= ((tmp_char3 >> 5) & 0x00000001) << i;
-                absQuant[27] |= ((tmp_char3 >> 4) & 0x00000001) << i;
-                absQuant[28] |= ((tmp_char3 >> 3) & 0x00000001) << i;
-                absQuant[29] |= ((tmp_char3 >> 2) & 0x00000001) << i;
-                absQuant[30] |= ((tmp_char3 >> 1) & 0x00000001) << i;
-                absQuant[31] |= ((tmp_char3 >> 0) & 0x00000001) << i;
-            }
-
-            int32_t prevQuant = 0;
-            for (int i = 0; i < 32; i++)
-            {
-                int32_t currQuant = zigzag_decode(absQuant[i]) + prevQuant;
-                decData[temp_start_idx + i] = currQuant * eb;
-                prevQuant = currQuant;
+        if (bits == 0) {
+            for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
+                quant_group[i * QUANT_GROUP_SIZE + j] = 0;
             }
         } else {
-            for(int i = 0; i < 32; i++)
-            {
-                decData[temp_start_idx + i] = 0.f;
-            }
+#if INTERLEAVE_BITS == 1
+            deinterleave_words_1bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+#elif INTERLEAVE_BITS == 2
+            deinterleave_words_2bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+#elif INTERLEAVE_BITS == 4
+            deinterleave_words_4bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+#elif INTERLEAVE_BITS == 8
+            deinterleave_words_8bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+#else
+#error "Invalid INTERLEAVE_BITS value. Must be 1, 2, 4, or 8."
+#endif
+        }
+
+        compressed_words += bits;
+
+        // Restore the max value
+        quant_group[i * QUANT_GROUP_SIZE + max_index] = max_quant;
+
+        // Zig-zag decode and inverse delta encoding
+        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
+            int32_t curr_quant = zigzag_decode(quant_group[i * QUANT_GROUP_SIZE + j]) + prev_quant;
+            prev_quant = curr_quant;
+
+            int float_index = block_float_start + i * QUANT_GROUP_SIZE + j;
+            decompressed_floats[float_index] = curr_quant * epsilon;
         }
     }
 }
@@ -705,49 +698,88 @@ bool FloatDecompressor::Decompress(
         return false;
     }
 
-
-
-    const size_t r = ZSTD_decompress(
-        decompressed,
-        original_bytes,
-        compressed_data,
-        compressed_bytes);
-
-    if (ZSTD_isError(r) || r != (size_t)original_bytes) {
-        LOG_ERROR() << "Decompressor: Failed to decompress: r=" << r
-            << " original_bytes=" << original_bytes << " err=" << ZSTD_getErrorName(r);
+    // Read header
+    const uint8_t* data = static_cast<const uint8_t*>(compressed_data);
+    uint32_t magic = read_uint32_le(data);
+    if (magic != kMagic) {
         return false;
     }
+    float epsilon = read_float_le(data + 4);
+    int float_count = read_uint32_le(data + 8);
 
-    uint32_t* unpacked = reinterpret_cast<uint32_t*>( Result.data() );
+    // Calculate block count
+    int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
+    const int block_bytes = BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float);
 
-    for (uint32_t i = 0; i < original_tokens; ++i) {
-        uint8_t unpacked_word[8] = {0};
-        for (uint32_t j = 0; j < token_bytes; j++) {
-            unpacked_word[j] = decompressed[i + j * original_tokens];
-        }
-
-        unpacked[i] = read_uint32_le(unpacked_word);
+    // Read block used words
+    std::vector<uint32_t> block_used_words(block_count);
+    for (int i = 0; i < block_count; ++i) {
+        block_used_words[i] = read_uint32_le(data + kHeaderBytes + i * 4);
     }
 
-    // Copy data to device
-    float* original_data = nullptr;
-    cudaError_t err = cudaMalloc((void**)&original_data, sizeof(float)*float_count);
-    if (err != cudaSuccess) { return -1; }
-    CallbackScope original_data_cleanup([&]() { cudaFree(original_data); });
-    cudaMemcpy(original_data, float_data, sizeof(float)*float_count, cudaMemcpyHostToDevice);
+    // Initialize zstd
+    ZSTD_DStream* zds = ZSTD_createDStream();
+    if (zds == NULL) { return false; }
+    CallbackScope zds_cleanup([&]() { ZSTD_freeDStream(zds); });
 
-    int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
-    const int block_bytes = BLOCK_PARAM_COUNT*PARAM_SIZE + BLOCK_FLOAT_COUNT*sizeof(float);
+    size_t const init_result = ZSTD_initDStream(zds);
+    if (ZSTD_isError(init_result)) { return false; }
 
-    // Create output buffer
-    uint8_t* compressed_blocks = nullptr;
-    cudaError_t err = cudaMallocManaged((void**)&compressed_blocks, block_count*block_bytes + block_count*sizeof(uint32_t));
-    if (err != cudaSuccess) { return -1; }
-    CallbackScope original_data_cleanup([&]() { cudaFree(compressed_blocks); });
-    uint32_t* block_used_words = reinterpret_cast<uint32_t*>(compressed_blocks + block_count*block_bytes);
+    // Prepare input buffer for zstd
+    ZSTD_inBuffer input = { data, static_cast<size_t>(compressed_bytes), kHeaderBytes + block_count * 4 };
 
-    cudaStream_t stream = nullptr;
-    cudaStreamCreate(&stream);
-    CallbackScope stream_cleanup([&]() { cudaStreamDestroy(stream); });
+    // Allocate device memory for decompressed data
+    float* decompressed_floats = nullptr;
+    cudaError_t err = cudaMalloc((void**)&decompressed_floats, sizeof(float) * float_count);
+    if (err != cudaSuccess) { return false; }
+    CallbackScope decompressed_floats_cleanup([&]() { cudaFree(decompressed_floats); });
+
+    // Allocate device memory for compressed blocks
+    uint8_t* d_compressed_blocks = nullptr;
+    err = cudaMalloc((void**)&d_compressed_blocks, block_count * block_bytes);
+    if (err != cudaSuccess) { return false; }
+    CallbackScope d_compressed_blocks_cleanup([&]() { cudaFree(d_compressed_blocks); });
+
+    // Allocate host memory for temporary storage of decompressed blocks
+    std::vector<uint8_t> h_decompressed_block(block_bytes);
+
+    // Decompress each block
+    for (int i = 0; i < block_count; ++i) {
+        ZSTD_outBuffer output = { h_decompressed_block.data(), block_bytes, 0 };
+
+        while (output.pos < block_used_words[i] * 4 + BLOCK_PARAM_COUNT * PARAM_SIZE) {
+            size_t const result = ZSTD_decompressStream(zds, &output, &input);
+            if (ZSTD_isError(result)) { return false; }
+            if (result == 0) break;
+        }
+
+        // Copy decompressed block to device
+        err = cudaMemcpy(d_compressed_blocks + i * block_bytes, h_decompressed_block.data(), 
+                         output.pos, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) { return false; }
+    }
+
+    // Launch decompression kernel
+    dim3 blockSize(BLOCK_SIZE);
+    dim3 gridSize(block_count);
+    SZplus_decompress_kernel_f32<<<gridSize, blockSize>>>(
+        decompressed_floats,
+        d_compressed_blocks,
+        block_used_words.data(),
+        epsilon);
+
+    // Check for kernel launch errors
+    err = cudaGetLastError();
+    if (err != cudaSuccess) { return false; }
+
+    // Wait for kernel to finish
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) { return false; }
+
+    // Copy result back to host
+    Result.resize(float_count * sizeof(float));
+    err = cudaMemcpy(Result.data(), decompressed_floats, Result.size(), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { return false; }
+
+    return true;
 }
