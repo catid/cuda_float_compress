@@ -7,38 +7,29 @@
 
 
 //------------------------------------------------------------------------------
-// FloatCompressor
+// Compress API
 
-struct FloatCompressor {
-    bool Compress(
-        cudaStream_t stream,
-        const float* float_data,
-        bool is_device_ptr,
-        int float_count,
-        float epsilon = 0.0001f);
+int GetCompressedBufferSize(int float_count);
 
-    // Result of Compress()
-    std::vector<uint8_t> Result;
-
-    int GetCompressedBytes() const {
-        return static_cast<int>( Result.size() );
-    }
-};
+bool CompressFloats(
+    cudaStream_t stream,
+    const float* float_data,
+    bool is_device_ptr,
+    int float_count,
+    uint8_t* compressed_buffer,
+    int& compressed_bytes,
+    float epsilon = 0.0001f);
 
 
 //------------------------------------------------------------------------------
-// FloatDecompressor
+// Decompress API
 
-struct FloatDecompressor {
-    bool Decompress(
-        cudaStream_t stream,
-        const void* compressed_data,
-        int compressed_bytes);
+int GetDecompressedFloatCount(
+    const void* compressed_data,
+    int compressed_bytes);
 
-    // Result of Decompress()
-    std::vector<float> Result;
-
-    int GetFloatCount() const {
-        return static_cast<int>( Result.size() );
-    }
-};
+bool DecompressFloats(
+    cudaStream_t stream,
+    const void* compressed_data,
+    int compressed_bytes,
+    float* decompressed_floats);

@@ -478,7 +478,7 @@ void cpu_deinterleave_4bit(const uint32_t* input, uint32_t* output, int block_co
 //------------------------------------------------------------------------------
 // Compression Kernel
 
-__global__ void SZplus_compress_kernel_f32(
+__global__ void SZplus_compress(
     const float* const __restrict__ original_data,
     float epsilon,
     uint32_t* __restrict__ block_used_words,
@@ -584,13 +584,80 @@ __global__ void SZplus_compress_kernel_f32(
 
 
 //------------------------------------------------------------------------------
-// FloatCompressor
+// Decompression Kernel
 
-bool FloatCompressor::Compress(
+__global__ void SZplus_decompress(
+    float* const __restrict__ decompressed_floats,
+    const uint8_t* __restrict__ compressed_blocks,
+    const uint32_t* const __restrict__ block_used_words,
+    float epsilon)
+{
+    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int block_float_start = thread_idx * THREAD_FLOAT_COUNT;
+
+    const uint8_t* block_data = compressed_blocks + blockIdx.x * (BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float));
+    const uint32_t* compressed_words = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * PARAM_SIZE);
+
+    uint32_t quant_group[THREAD_FLOAT_COUNT];
+    int32_t prev_quant = 0;
+
+    for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
+        const uint8_t max_index = block_data[THREAD_GROUP_COUNT * threadIdx.x + i];
+        const uint8_t bits = block_data[BLOCK_PARAM_COUNT + THREAD_GROUP_COUNT * threadIdx.x + i];
+        const uint32_t* high_bits = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * 2);
+        const uint32_t max_quant = (high_bits[THREAD_GROUP_COUNT * threadIdx.x + i] << bits) | ((1 << bits) - 1);
+
+        if (bits == 0) {
+            for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
+                quant_group[i * QUANT_GROUP_SIZE + j] = 0;
+            }
+        } else {
+#if INTERLEAVE_BITS == 1
+            deinterleave_words_1bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+#elif INTERLEAVE_BITS == 2
+            deinterleave_words_2bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+#elif INTERLEAVE_BITS == 4
+            deinterleave_words_4bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+#elif INTERLEAVE_BITS == 8
+            deinterleave_words_8bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+#else
+#error "Invalid INTERLEAVE_BITS value. Must be 1, 2, 4, or 8."
+#endif
+        }
+
+        compressed_words += bits;
+
+        // Restore the max value
+        quant_group[i * QUANT_GROUP_SIZE + max_index] = max_quant;
+
+        // Zig-zag decode and inverse delta encoding
+        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
+            int32_t curr_quant = zigzag_decode(quant_group[i * QUANT_GROUP_SIZE + j]) + prev_quant;
+            prev_quant = curr_quant;
+
+            int float_index = block_float_start + i * QUANT_GROUP_SIZE + j;
+            decompressed_floats[float_index] = curr_quant * epsilon;
+        }
+    }
+}
+
+
+//------------------------------------------------------------------------------
+// Compress API
+
+int GetCompressedBufferSize(int float_count)
+{
+    const int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
+    return block_count * BLOCK_BYTES;
+}
+
+bool CompressFloats(
     cudaStream_t stream,
-    const float* original_data,
+    const float* float_data,
     bool is_device_ptr,
     int float_count,
+    uint8_t* compressed_buffer,
+    int& compressed_bytes,
     float epsilon)
 {
     // If it's not a device pointer, we need to copy the data to the device
@@ -601,8 +668,8 @@ bool FloatCompressor::Compress(
             cerr << "cudaMalloc failed: err=" << cudaGetErrorString(err) << " float_count=" << float_count << endl;
             return false;
         }
-        cudaMemcpyAsync(d_original_data, original_data, sizeof(float)*float_count, cudaMemcpyHostToDevice, stream);
-        original_data = d_original_data;
+        cudaMemcpyAsync(d_original_data, float_data, sizeof(float)*float_count, cudaMemcpyHostToDevice, stream);
+        float_data = d_original_data;
     }
     CallbackScope original_data_cleanup([&]() { if (d_original_data) cudaFree(d_original_data); });
 
@@ -620,8 +687,8 @@ bool FloatCompressor::Compress(
 
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
-    SZplus_compress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(
-        original_data,
+    SZplus_compress<<<gridSize, blockSize, 0, stream>>>(
+        float_data,
         epsilon,
         block_used_words,
         compressed_blocks);
@@ -641,8 +708,7 @@ bool FloatCompressor::Compress(
         return false;
     }
 
-    Result.resize(BLOCK_BYTES * block_count);
-    ZSTD_outBuffer output = { Result.data(), Result.size(), 0 };
+    ZSTD_outBuffer output = { compressed_buffer, (unsigned)compressed_bytes, 0 };
 
     // Prepare header
     std::vector<uint8_t> header_buffer(kHeaderBytes + block_count*sizeof(uint32_t));
@@ -711,77 +777,40 @@ bool FloatCompressor::Compress(
         }
     }
 
-    Result.resize(output.pos);
+    compressed_bytes = static_cast<int>(output.pos);
     return true;
 }
 
 
 //------------------------------------------------------------------------------
-// Decompression Kernel
+// Decompress API
 
-__global__ void SZplus_decompress_kernel_f32(
-    float* const __restrict__ decompressed_floats,
-    const uint8_t* __restrict__ compressed_blocks,
-    const uint32_t* const __restrict__ block_used_words,
-    float epsilon)
-{
-    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int block_float_start = thread_idx * THREAD_FLOAT_COUNT;
-
-    const uint8_t* block_data = compressed_blocks + blockIdx.x * (BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float));
-    const uint32_t* compressed_words = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * PARAM_SIZE);
-
-    uint32_t quant_group[THREAD_FLOAT_COUNT];
-    int32_t prev_quant = 0;
-
-    for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
-        const uint8_t max_index = block_data[THREAD_GROUP_COUNT * threadIdx.x + i];
-        const uint8_t bits = block_data[BLOCK_PARAM_COUNT + THREAD_GROUP_COUNT * threadIdx.x + i];
-        const uint32_t* high_bits = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * 2);
-        const uint32_t max_quant = (high_bits[THREAD_GROUP_COUNT * threadIdx.x + i] << bits) | ((1 << bits) - 1);
-
-        if (bits == 0) {
-            for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
-                quant_group[i * QUANT_GROUP_SIZE + j] = 0;
-            }
-        } else {
-#if INTERLEAVE_BITS == 1
-            deinterleave_words_1bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
-#elif INTERLEAVE_BITS == 2
-            deinterleave_words_2bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
-#elif INTERLEAVE_BITS == 4
-            deinterleave_words_4bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
-#elif INTERLEAVE_BITS == 8
-            deinterleave_words_8bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
-#else
-#error "Invalid INTERLEAVE_BITS value. Must be 1, 2, 4, or 8."
-#endif
-        }
-
-        compressed_words += bits;
-
-        // Restore the max value
-        quant_group[i * QUANT_GROUP_SIZE + max_index] = max_quant;
-
-        // Zig-zag decode and inverse delta encoding
-        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
-            int32_t curr_quant = zigzag_decode(quant_group[i * QUANT_GROUP_SIZE + j]) + prev_quant;
-            prev_quant = curr_quant;
-
-            int float_index = block_float_start + i * QUANT_GROUP_SIZE + j;
-            decompressed_floats[float_index] = curr_quant * epsilon;
-        }
-    }
-}
-
-
-//------------------------------------------------------------------------------
-// FloatDecompressor
-
-bool FloatDecompressor::Decompress(
-    cudaStream_t stream,
+int GetDecompressedFloatCount(
     const void* compressed_data,
     int compressed_bytes)
+{
+    if (compressed_bytes < kHeaderBytes) {
+        cerr << "ERROR: Compressed data is too small. Expected at least " << kHeaderBytes << " bytes, but got " << compressed_bytes << " bytes." << endl;
+        return -1;  // Return -1 to indicate an error
+    }
+
+    const uint8_t* data = static_cast<const uint8_t*>(compressed_data);
+
+    // Check magic number
+    const uint32_t magic = read_uint32_le(data);
+    if (magic != kMagic) {
+        cerr << "ERROR: Invalid magic number. Expected 0x" << hex << kMagic << ", but got 0x" << magic << dec << endl;
+        return -1;  // Return -1 to indicate an error
+    }
+
+    return read_uint32_le(data + 8);
+}
+
+bool DecompressFloats(
+    cudaStream_t stream,
+    const void* compressed_data,
+    int compressed_bytes,
+    float* decompressed_floats)
 {
     if (compressed_bytes < kHeaderBytes) {
         cerr << "ERROR: Compressed data is too small. Expected at least " << kHeaderBytes << " bytes, but got " << compressed_bytes << " bytes." << endl;
@@ -851,20 +880,11 @@ bool FloatDecompressor::Decompress(
         }
     }
 
-    // Allocate device memory for decompressed floats
-    float* decompressed_floats = nullptr;
-    err = cudaMallocAsync((void**)&decompressed_floats, sizeof(float) * float_count, stream);
-    if (err != cudaSuccess) {
-        cerr << "ERROR: Failed to allocate device memory for decompressed floats: " << cudaGetErrorString(err) << endl;
-        return false;
-    }
-    CallbackScope decompressed_floats_cleanup([&]() { cudaFreeAsync(decompressed_floats, stream); });
-
     // Launch decompression kernel
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
     cerr << "INFO: Launching decompression kernel with grid size " << gridSize.x << " and block size " << blockSize.x << endl;
-    SZplus_decompress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(
+    SZplus_decompress<<<gridSize, blockSize, 0, stream>>>(
         decompressed_floats,
         managed_decompressed_blocks,
         block_used_words.data(),
@@ -874,14 +894,6 @@ bool FloatDecompressor::Decompress(
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         cerr << "ERROR: Decompression kernel launch failed: " << cudaGetErrorString(err) << endl;
-        return false;
-    }
-
-    // Copy result back to host
-    Result.resize(float_count * sizeof(float));
-    err = cudaMemcpyAsync(Result.data(), decompressed_floats, Result.size(), cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) {
-        cerr << "ERROR: Failed to copy decompressed data back to host: " << cudaGetErrorString(err) << endl;
         return false;
     }
 
