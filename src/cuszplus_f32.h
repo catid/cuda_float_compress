@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <vector>
 
@@ -9,7 +11,9 @@
 
 struct FloatCompressor {
     bool Compress(
+        cudaStream_t stream,
         const float* float_data,
+        bool is_device_ptr,
         int float_count,
         float epsilon = 0.0001f);
 
@@ -27,6 +31,7 @@ struct FloatCompressor {
 
 struct FloatDecompressor {
     bool Decompress(
+        cudaStream_t stream,
         const void* compressed_data,
         int compressed_bytes);
 

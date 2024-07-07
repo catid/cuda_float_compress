@@ -8,12 +8,6 @@
 #include <vector>
 #include <stdexcept>
 
-static void checkCudaErrors(cudaError_t err, const char* location) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string(location) + ": " + cudaGetErrorString(err));
-    }
-}
-
 torch::Tensor cuszplus_compress(torch::Tensor input, float errorBound) {
     if (!input.is_contiguous()) {
         input = input.contiguous();
@@ -30,21 +24,12 @@ torch::Tensor cuszplus_compress(torch::Tensor input, float errorBound) {
     torch::Tensor cmpBytes = torch::empty(nbEle * sizeof(float), options);
     size_t cmpSize = 0;
 
-    if (!input.is_cuda()) {
-        // CPU processing
-        int r = SZplus_compress_hostptr_f32(data, cmpBytes.data_ptr<unsigned char>(), nbEle, &cmpSize, errorBound);
-        if (r != 0) {
-            throw std::runtime_error("SZp_compress_hostptr_f32 failed: nbEle=" + std::to_string(nbEle));
-        }
-    } else {
-        // GPU processing
-        cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-        int r = SZplus_compress_deviceptr_f32(data, cmpBytes.data_ptr<unsigned char>(), nbEle, &cmpSize, errorBound, stream);
-        if (r != 0) {
-            throw std::runtime_error("SZp_compress_deviceptr_f32 failed: nbEle=" + std::to_string(nbEle));
-        }
-        checkCudaErrors(cudaGetLastError(), "SZp_compress_deviceptr_f32");
-        checkCudaErrors(cudaStreamSynchronize(stream), "cudaStreamSynchronize after compression");
+    FloatCompressor compressor;
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    if (!compressor.Compress(stream, data, input.is_cuda(), nbEle, errorBound)) {
+        throw std::runtime_error("compressor.Compress failed: nbEle=" + std::to_string(nbEle));
     }
 
     return cmpBytes.slice(0, cmpSize);
@@ -59,26 +44,21 @@ torch::Tensor cuszplus_decompress(torch::Tensor compressed, size_t nbEle, float 
         throw std::runtime_error("Compressed tensor must be of type uint8");
     }
 
+    if (compressed.is_cuda()) {
+        throw std::runtime_error("Input tensor must be on the CPU");
+    }
+
     const size_t cmpSize = compressed.numel();
 
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(compressed.device());
     torch::Tensor result = torch::empty(nbEle, options);
 
-    if (!compressed.is_cuda()) {
-        // CPU processing
-        int r = SZplus_decompress_hostptr_f32(result.data_ptr<float>(), compressed.data_ptr<unsigned char>(), nbEle, cmpSize, errorBound);
-        if (r != 0) {
-            throw std::runtime_error("SZplus_decompress_hostptr_f32 failed");
-        }
-    } else {
-        // GPU processing
-        cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-        int r = SZplus_decompress_deviceptr_f32(result.data_ptr<float>(), compressed.data_ptr<unsigned char>(), nbEle, cmpSize, errorBound, stream);
-        if (r != 0) {
-            throw std::runtime_error("SZplus_decompress_deviceptr_f32 failed");
-        }
-        checkCudaErrors(cudaGetLastError(), "SZplus_decompress_deviceptr_f32");
-        checkCudaErrors(cudaStreamSynchronize(stream), "cudaStreamSynchronize after compression");
+    FloatDecompressor decompressor;
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    if (!decompressor.Decompress(stream, compressed.data_ptr<unsigned char>(), cmpSize)) {
+        throw std::runtime_error("decompressor.Decompress failed");
     }
 
     return result;

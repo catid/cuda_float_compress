@@ -2,7 +2,6 @@
 
 #include <zstd.h>
 
-#include <cuda_runtime.h>
 #include <cub/cub.cuh> // CUB from CUDA Toolkit
 
 #include <iostream>
@@ -14,7 +13,7 @@ using namespace std;
 
 static const int kZstdCompressionLevel = 1;
 static const uint32_t kMagic = 0xCA7DD007;
-static const int kHeaderBytes = 4 + 4 + 4;
+static const uint32_t kHeaderBytes = 4 + 4 + 4;
 
 #define BLOCK_SIZE 256
 #define QUANT_GROUP_SIZE 32
@@ -514,36 +513,37 @@ __global__ void SZplus_compress_kernel_f32(
 // FloatCompressor
 
 bool FloatCompressor::Compress(
-    const float* float_data,
+    cudaStream_t stream,
+    const float* original_data,
+    bool is_device_ptr,
     int float_count,
     float epsilon)
 {
-    // Copy data to device
-    float* original_data = nullptr;
-    cudaError_t err = cudaMalloc((void**)&original_data, sizeof(float)*float_count);
-    if (err != cudaSuccess) {
-        cerr << "cudaMalloc failed: err=" << cudaGetErrorString(err) << " float_count=" << float_count << endl;
-        return -1;
+    // If it's not a device pointer, we need to copy the data to the device
+    float* d_original_data = nullptr;
+    if (!is_device_ptr) {
+        cudaError_t err = cudaMalloc((void**)&d_original_data, sizeof(float)*float_count);
+        if (err != cudaSuccess) {
+            cerr << "cudaMalloc failed: err=" << cudaGetErrorString(err) << " float_count=" << float_count << endl;
+            return false;
+        }
+        cudaMemcpyAsync(d_original_data, original_data, sizeof(float)*float_count, cudaMemcpyHostToDevice, stream);
+        original_data = d_original_data;
     }
-    CallbackScope original_data_cleanup([&]() { cudaFree(original_data); });
-    cudaMemcpy(original_data, float_data, sizeof(float)*float_count, cudaMemcpyHostToDevice);
+    CallbackScope original_data_cleanup([&]() { if (d_original_data) cudaFree(d_original_data); });
 
     int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
     const int block_bytes = BLOCK_PARAM_COUNT*PARAM_SIZE + BLOCK_FLOAT_COUNT*sizeof(float);
 
     // Create output buffer
     uint8_t* compressed_blocks = nullptr;
-    cudaError_t err = cudaMallocManaged((void**)&compressed_blocks, block_count*block_bytes + block_count*sizeof(uint32_t));
+    cudaError_t err = cudaMallocAsync((void**)&compressed_blocks, block_count*block_bytes + block_count*sizeof(uint32_t), stream);
     if (err != cudaSuccess) {
-        cerr << "cudaMallocManaged failed: err=" << cudaGetErrorString(err) << " block_count=" << block_count << endl;
-        return -1;
+        cerr << "cudaMallocAsync failed: err=" << cudaGetErrorString(err) << " block_count=" << block_count << endl;
+        return false;
     }
-    CallbackScope original_data_cleanup([&]() { cudaFree(compressed_blocks); });
+    CallbackScope original_comp_cleanup([&]() { cudaFreeAsync(compressed_blocks, stream); });
     uint32_t* block_used_words = reinterpret_cast<uint32_t*>(compressed_blocks + block_count*block_bytes);
-
-    cudaStream_t stream = nullptr;
-    cudaStreamCreate(&stream);
-    CallbackScope stream_cleanup([&]() { cudaStreamDestroy(stream); });
 
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
@@ -555,17 +555,28 @@ bool FloatCompressor::Compress(
 
     // Initialize zstd
     auto zcs = ZSTD_createCStream();
-    if (zcs == NULL) { return false; }
+    if (!zcs) {
+        cerr << "ERROR: ZSTD_createCStream failed" << endl;
+        return false;
+    }
     CallbackScope zcs_cleanup([&]() { ZSTD_freeCStream(zcs); });
 
     // Initialize the compression stream
     size_t const initResult = ZSTD_initCStream(zcs, kZstdCompressionLevel);
-    if (ZSTD_isError(initResult)) { return false; }
+    if (ZSTD_isError(initResult)) {
+        cerr << "ERROR: ZSTD_initCStream failed: initResult=" << initResult << endl;
+        return false;
+    }
 
     Result.resize(block_bytes * block_count);
     ZSTD_outBuffer output = { Result.data(), Result.size(), 0 };
 
-    cudaDeviceSynchronize();
+    cudaStreamSynchronize(stream);
+
+    if (cudaSuccess != cudaGetLastError()) {
+        cerr << "ERROR: Encountered a CUDA error during FloatCompressor::Compress" << endl;
+        return false;
+    }
 
     {
         std::vector<uint8_t> header_buffer(kHeaderBytes + block_count*sizeof(uint32_t));
@@ -581,9 +592,13 @@ bool FloatCompressor::Compress(
 
         while (input.pos < input.size) {
             size_t const compressResult = ZSTD_compressStream(zcs, &output, &input);
-            if (ZSTD_isError(compressResult)) { return false; }
+            if (ZSTD_isError(compressResult)) {
+                cerr << "ERROR: ZSTD_compressStream failed: compressResult=" << compressResult << endl;
+                return false;
+            }
 
             if (output.pos == output.size) {
+                cerr << "ERROR: ZSTD_compressStream failed: compressResult=" << compressResult << endl;
                 return false;
             }
         }
@@ -603,6 +618,7 @@ bool FloatCompressor::Compress(
             if (ZSTD_isError(compressResult)) { return false; }
 
             if (output.pos == output.size) {
+                cerr << "ERROR: ZSTD_compressStream failed: compressResult=" << compressResult << endl;
                 return false;
             }
         }
@@ -619,6 +635,7 @@ bool FloatCompressor::Compress(
         }
 
         if (output.pos == output.size) {
+            cerr << "ERROR: ZSTD_endStream failed: remainingToFlush=" << remainingToFlush << std::endl;
             return false;
         }
     }
@@ -691,10 +708,12 @@ __global__ void SZplus_decompress_kernel_f32(
 // FloatDecompressor
 
 bool FloatDecompressor::Decompress(
+    cudaStream_t stream,
     const void* compressed_data,
     int compressed_bytes)
 {
     if (compressed_bytes < kHeaderBytes) {
+        cerr << "ERROR: Compressed data is too small. Expected at least " << kHeaderBytes << " bytes, but got " << compressed_bytes << " bytes." << endl;
         return false;
     }
 
@@ -702,14 +721,19 @@ bool FloatDecompressor::Decompress(
     const uint8_t* data = static_cast<const uint8_t*>(compressed_data);
     uint32_t magic = read_uint32_le(data);
     if (magic != kMagic) {
+        cerr << "ERROR: Invalid magic number. Expected 0x" << hex << kMagic << ", but got 0x" << magic << dec << endl;
         return false;
     }
     float epsilon = read_float_le(data + 4);
     int float_count = read_uint32_le(data + 8);
 
+    cerr << "INFO: Decompressing " << float_count << " floats with epsilon " << epsilon << endl;
+
     // Calculate block count
     int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
     const int block_bytes = BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float);
+
+    cerr << "INFO: Block count: " << block_count << ", Block bytes: " << block_bytes << endl;
 
     // Read block used words
     std::vector<uint32_t> block_used_words(block_count);
@@ -719,26 +743,38 @@ bool FloatDecompressor::Decompress(
 
     // Initialize zstd
     ZSTD_DStream* zds = ZSTD_createDStream();
-    if (zds == NULL) { return false; }
+    if (zds == NULL) {
+        cerr << "ERROR: Failed to create ZSTD_DStream" << endl;
+        return false;
+    }
     CallbackScope zds_cleanup([&]() { ZSTD_freeDStream(zds); });
 
     size_t const init_result = ZSTD_initDStream(zds);
-    if (ZSTD_isError(init_result)) { return false; }
+    if (ZSTD_isError(init_result)) {
+        cerr << "ERROR: Failed to initialize ZSTD_DStream: " << ZSTD_getErrorName(init_result) << endl;
+        return false;
+    }
 
     // Prepare input buffer for zstd
     ZSTD_inBuffer input = { data, static_cast<size_t>(compressed_bytes), kHeaderBytes + block_count * 4 };
 
     // Allocate device memory for decompressed data
     float* decompressed_floats = nullptr;
-    cudaError_t err = cudaMalloc((void**)&decompressed_floats, sizeof(float) * float_count);
-    if (err != cudaSuccess) { return false; }
-    CallbackScope decompressed_floats_cleanup([&]() { cudaFree(decompressed_floats); });
+    cudaError_t err = cudaMallocAsync((void**)&decompressed_floats, sizeof(float) * float_count, stream);
+    if (err != cudaSuccess) {
+        cerr << "ERROR: Failed to allocate device memory for decompressed data: " << cudaGetErrorString(err) << endl;
+        return false;
+    }
+    CallbackScope decompressed_floats_cleanup([&]() { cudaFreeAsync(decompressed_floats, stream); });
 
     // Allocate device memory for compressed blocks
     uint8_t* d_compressed_blocks = nullptr;
-    err = cudaMalloc((void**)&d_compressed_blocks, block_count * block_bytes);
-    if (err != cudaSuccess) { return false; }
-    CallbackScope d_compressed_blocks_cleanup([&]() { cudaFree(d_compressed_blocks); });
+    err = cudaMallocAsync((void**)&d_compressed_blocks, block_count * block_bytes, stream);
+    if (err != cudaSuccess) {
+        cerr << "ERROR: Failed to allocate device memory for compressed blocks: " << cudaGetErrorString(err) << endl;
+        return false;
+    }
+    CallbackScope d_compressed_blocks_cleanup([&]() { cudaFreeAsync(d_compressed_blocks, stream); });
 
     // Allocate host memory for temporary storage of decompressed blocks
     std::vector<uint8_t> h_decompressed_block(block_bytes);
@@ -749,20 +785,27 @@ bool FloatDecompressor::Decompress(
 
         while (output.pos < block_used_words[i] * 4 + BLOCK_PARAM_COUNT * PARAM_SIZE) {
             size_t const result = ZSTD_decompressStream(zds, &output, &input);
-            if (ZSTD_isError(result)) { return false; }
+            if (ZSTD_isError(result)) {
+                cerr << "ERROR: ZSTD decompression failed for block " << i << ": " << ZSTD_getErrorName(result) << endl;
+                return false;
+            }
             if (result == 0) break;
         }
 
         // Copy decompressed block to device
-        err = cudaMemcpy(d_compressed_blocks + i * block_bytes, h_decompressed_block.data(), 
-                         output.pos, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) { return false; }
+        err = cudaMemcpyAsync(d_compressed_blocks + i * block_bytes, h_decompressed_block.data(), 
+                              output.pos, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess) {
+            cerr << "ERROR: Failed to copy decompressed block " << i << " to device: " << cudaGetErrorString(err) << endl;
+            return false;
+        }
     }
 
     // Launch decompression kernel
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
-    SZplus_decompress_kernel_f32<<<gridSize, blockSize>>>(
+    cerr << "INFO: Launching decompression kernel with grid size " << gridSize.x << " and block size " << blockSize.x << endl;
+    SZplus_decompress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(
         decompressed_floats,
         d_compressed_blocks,
         block_used_words.data(),
@@ -770,16 +813,26 @@ bool FloatDecompressor::Decompress(
 
     // Check for kernel launch errors
     err = cudaGetLastError();
-    if (err != cudaSuccess) { return false; }
-
-    // Wait for kernel to finish
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) { return false; }
+    if (err != cudaSuccess) {
+        cerr << "ERROR: Decompression kernel launch failed: " << cudaGetErrorString(err) << endl;
+        return false;
+    }
 
     // Copy result back to host
     Result.resize(float_count * sizeof(float));
-    err = cudaMemcpy(Result.data(), decompressed_floats, Result.size(), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { return false; }
+    err = cudaMemcpyAsync(Result.data(), decompressed_floats, Result.size(), cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        cerr << "ERROR: Failed to copy decompressed data back to host: " << cudaGetErrorString(err) << endl;
+        return false;
+    }
 
+    // Wait for kernel to finish
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        cerr << "ERROR: Decompression kernel execution failed: " << cudaGetErrorString(err) << endl;
+        return false;
+    }
+
+    cerr << "INFO: Decompression completed successfully" << endl;
     return true;
 }
