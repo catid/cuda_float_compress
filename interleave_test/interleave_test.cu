@@ -498,12 +498,444 @@ void run_test(int bits) {
     cout << endl;
 }
 
+//------------------------------------------------------------------------------
+// GPU De-interleave Kernels
+
+__device__ void deinterleave_words_1bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output)
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 32; i++) {
+        uint32_t result = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 32; j++) {
+            result |= ((input[j] >> i) & 1) << j;
+        }
+        output[i] = result;
+    }
+}
+
+__device__ void deinterleave_words_2bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output)
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 16; i++) {
+        uint32_t result_0 = 0, result_1 = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 16; j++) {
+            result_0 |= ((input[j*2] >> (i*2)) & 3) << (j*2);
+            result_1 |= ((input[j*2+1] >> (i*2)) & 3) << (j*2);
+        }
+        output[i] = result_0;
+        output[i + 16] = result_1;
+    }
+}
+
+__device__ void deinterleave_words_4bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output)
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; i++) {
+        uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8; j++) {
+            result_0 |= ((input[j*4] >> (i*4)) & 0xF) << (j*4);
+            result_1 |= ((input[j*4+1] >> (i*4)) & 0xF) << (j*4);
+            result_2 |= ((input[j*4+2] >> (i*4)) & 0xF) << (j*4);
+            result_3 |= ((input[j*4+3] >> (i*4)) & 0xF) << (j*4);
+        }
+        output[i] = result_0;
+        output[i + 8] = result_1;
+        output[i + 16] = result_2;
+        output[i + 24] = result_3;
+    }
+}
+
+__device__ void deinterleave_words_8bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output)
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 4; i++) {
+        uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
+        uint32_t result_4 = 0, result_5 = 0, result_6 = 0, result_7 = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            result_0 |= ((input[j*8] >> (i*8)) & 0xFF) << (j*8);
+            result_1 |= ((input[j*8+1] >> (i*8)) & 0xFF) << (j*8);
+            result_2 |= ((input[j*8+2] >> (i*8)) & 0xFF) << (j*8);
+            result_3 |= ((input[j*8+3] >> (i*8)) & 0xFF) << (j*8);
+            result_4 |= ((input[j*8+4] >> (i*8)) & 0xFF) << (j*8);
+            result_5 |= ((input[j*8+5] >> (i*8)) & 0xFF) << (j*8);
+            result_6 |= ((input[j*8+6] >> (i*8)) & 0xFF) << (j*8);
+            result_7 |= ((input[j*8+7] >> (i*8)) & 0xFF) << (j*8);
+        }
+        output[i] = result_0;
+        output[i + 4] = result_1;
+        output[i + 8] = result_2;
+        output[i + 12] = result_3;
+        output[i + 16] = result_4;
+        output[i + 20] = result_5;
+        output[i + 24] = result_6;
+        output[i + 28] = result_7;
+    }
+}
+
+//------------------------------------------------------------------------------
+// GPU De-interleave Kernel Wrappers
+
+__global__ void deinterleave_kernel_1bit(
+    const uint32_t* input,
+    uint32_t* output)
+{
+    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    input += thread_idx * 32;
+    output += thread_idx * 32;
+    deinterleave_words_1bit(input, output);
+}
+
+__global__ void deinterleave_kernel_2bit(
+    const uint32_t* input,
+    uint32_t* output)
+{
+    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    input += thread_idx * 32;
+    output += thread_idx * 32;
+    deinterleave_words_2bit(input, output);
+}
+
+__global__ void deinterleave_kernel_4bit(
+    const uint32_t* input,
+    uint32_t* output)
+{
+    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    input += thread_idx * 32;
+    output += thread_idx * 32;
+    deinterleave_words_4bit(input, output);
+}
+
+__global__ void deinterleave_kernel_8bit(
+    const uint32_t* input,
+    uint32_t* output)
+{
+    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    input += thread_idx * 32;
+    output += thread_idx * 32;
+    deinterleave_words_8bit(input, output);
+}
+
+//------------------------------------------------------------------------------
+// CPU De-interleave Functions
+
+void cpu_deinterleave_1bit(const uint32_t* input, uint32_t* output, int block_count) {
+    for (int block = 0; block < block_count; ++block) {
+        const uint32_t* block_input = input + (block * 32);
+        uint32_t* block_output = output + (block * 32);
+        
+        for (int i = 0; i < 32; ++i) {
+            uint32_t result = 0;
+            for (int j = 0; j < 32; ++j) {
+                result |= ((block_input[j] >> i) & 1) << j;
+            }
+            block_output[i] = result;
+        }
+    }
+}
+
+void cpu_deinterleave_2bit(const uint32_t* input, uint32_t* output, int block_count) {
+    for (int block = 0; block < block_count; ++block) {
+        const uint32_t* block_input = input + (block * 32);
+        uint32_t* block_output = output + (block * 32);
+        
+        for (int i = 0; i < 16; ++i) {
+            uint32_t result_0 = 0, result_1 = 0;
+            for (int j = 0; j < 16; ++j) {
+                result_0 |= ((block_input[j*2] >> (i*2)) & 3) << (j*2);
+                result_1 |= ((block_input[j*2+1] >> (i*2)) & 3) << (j*2);
+            }
+            block_output[i] = result_0;
+            block_output[i + 16] = result_1;
+        }
+    }
+}
+
+void cpu_deinterleave_4bit(const uint32_t* input, uint32_t* output, int block_count) {
+    for (int block = 0; block < block_count; ++block) {
+        const uint32_t* block_input = input + (block * 32);
+        uint32_t* block_output = output + (block * 32);
+        
+        for (int i = 0; i < 8; ++i) {
+            uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
+            for (int j = 0; j < 8; ++j) {
+                result_0 |= ((block_input[j*4] >> (i*4)) & 0xF) << (j*4);
+                result_1 |= ((block_input[j*4+1] >> (i*4)) & 0xF) << (j*4);
+                result_2 |= ((block_input[j*4+2] >> (i*4)) & 0xF) << (j*4);
+                result_3 |= ((block_input[j*4+3] >> (i*4)) & 0xF) << (j*4);
+            }
+            block_output[i] = result_0;
+            block_output[i + 8] = result_1;
+            block_output[i + 16] = result_2;
+            block_output[i + 24] = result_3;
+        }
+    }
+}
+
+void cpu_deinterleave_8bit(const uint32_t* input, uint32_t* output, int block_count) {
+    for (int block = 0; block < block_count; ++block) {
+        const uint32_t* block_input = input + (block * 32);
+        uint32_t* block_output = output + (block * 32);
+        
+        for (int i = 0; i < 4; ++i) {
+            uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
+            uint32_t result_4 = 0, result_5 = 0, result_6 = 0, result_7 = 0;
+            for (int j = 0; j < 4; ++j) {
+                result_0 |= ((block_input[j*8] >> (i*8)) & 0xFF) << (j*8);
+                result_1 |= ((block_input[j*8+1] >> (i*8)) & 0xFF) << (j*8);
+                result_2 |= ((block_input[j*8+2] >> (i*8)) & 0xFF) << (j*8);
+                result_3 |= ((block_input[j*8+3] >> (i*8)) & 0xFF) << (j*8);
+                result_4 |= ((block_input[j*8+4] >> (i*8)) & 0xFF) << (j*8);
+                result_5 |= ((block_input[j*8+5] >> (i*8)) & 0xFF) << (j*8);
+                result_6 |= ((block_input[j*8+6] >> (i*8)) & 0xFF) << (j*8);
+                result_7 |= ((block_input[j*8+7] >> (i*8)) & 0xFF) << (j*8);
+            }
+            block_output[i] = result_0;
+            block_output[i + 4] = result_1;
+            block_output[i + 8] = result_2;
+            block_output[i + 12] = result_3;
+            block_output[i + 16] = result_4;
+            block_output[i + 20] = result_5;
+            block_output[i + 24] = result_6;
+            block_output[i + 28] = result_7;
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// Test function for de-interleave
+
+void run_deinterleave_test(int bits) {
+    const int value_count = 2 * 1024 * 1024;
+    const int interleaved_count = 32;
+    const int operation_count = value_count / interleaved_count;
+    const int block_size = 256;
+    const int block_count = operation_count / block_size;
+
+    // Allocate device memory
+    uint32_t *d_input, *d_output;
+    cudaMallocManaged(&d_input, value_count * sizeof(uint32_t));
+    CallbackScope input_cleanup([&]() { cudaFree(d_input); });
+    cudaMallocManaged(&d_output, value_count * sizeof(uint32_t));
+    CallbackScope output_cleanup([&]() { cudaFree(d_output); });
+    cudaCheckError();
+
+    for (int i = 0; i < value_count; i++) {
+        d_input[i] = rand();
+    }
+
+    // Create CUDA events for timing
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    std::vector<double> gpu_times, cpu_times;
+
+    int num_runs = NUM_RUNS;
+    if (bits == 1) {
+        num_runs = 3;
+    }
+
+    for (int run = 0; run < num_runs; run++) {
+        // Run the kernel
+        cudaEventRecord(start);
+        if (bits == 1) {
+            deinterleave_kernel_1bit<<<block_count, block_size>>>(d_input, d_output);
+        } else if (bits == 2) {
+            deinterleave_kernel_2bit<<<block_count, block_size>>>(d_input, d_output);
+        } else if (bits == 4) {
+            deinterleave_kernel_4bit<<<block_count, block_size>>>(d_input, d_output);
+        } else if (bits == 8) {
+            deinterleave_kernel_8bit<<<block_count, block_size>>>(d_input, d_output);
+        }
+        cudaEventRecord(stop);
+
+        cudaDeviceSynchronize();
+        cudaCheckError();
+
+        float gpu_milliseconds = 0;
+        cudaEventElapsedTime(&gpu_milliseconds, start, stop);
+        gpu_times.push_back(gpu_milliseconds);
+
+        // CPU Timing
+        std::vector<uint32_t> expected_output(value_count);
+        auto cpu_start = std::chrono::high_resolution_clock::now();
+        if (bits == 1) {
+            cpu_deinterleave_1bit(d_input, expected_output.data(), operation_count);
+        } else if (bits == 2) {
+            cpu_deinterleave_2bit(d_input, expected_output.data(), operation_count);
+        } else if (bits == 4) {
+            cpu_deinterleave_4bit(d_input, expected_output.data(), operation_count);
+        } else if (bits == 8) {
+            cpu_deinterleave_8bit(d_input, expected_output.data(), operation_count);
+        }
+        auto cpu_end = std::chrono::high_resolution_clock::now();
+        auto cpu_duration = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start);
+        cpu_times.push_back(cpu_duration.count() / 1000.0);
+
+        // Verify results (only for the first run)
+        if (run == 0) {
+            for (int i = 0; i < value_count; i++) {
+                if (d_output[i] != expected_output[i]) {
+                    cerr << "Mismatch at index " << i << " (" << bits << " bits de-interleave):\n";
+                    cerr << "Expected: 0x" << std::hex << expected_output[i] << std::dec << endl;
+                    cerr << "Got:      0x" << std::hex << d_output[i] << std::dec << endl;
+                    assert(false);
+                }
+            }
+        }
+    }
+
+    double median_gpu_time = median(gpu_times);
+    double median_cpu_time = median(cpu_times);
+
+    cout << "Test passed for " << bits << "-bit de-interleave with " << value_count << " values" << endl;
+    cout << "Median GPU Time: " << std::fixed << std::setprecision(3) << median_gpu_time << " ms" << endl;
+    cout << "Median CPU Time: " << std::fixed << std::setprecision(3) << median_cpu_time << " ms" << endl;
+    cout << "GPU Speedup: " << std::fixed << std::setprecision(2) << (median_cpu_time / median_gpu_time) << "x" << endl;
+    cout << endl;
+}
+
+
+//------------------------------------------------------------------------------
+// Unit Tests
+
+static void verify_data(const uint32_t* original, const uint32_t* result, int size, const string& test_name) {
+    for (int i = 0; i < size; ++i) {
+        if (original[i] != result[i]) {
+            cerr << "Mismatch in " << test_name << " at index " << i << ":\n";
+            cerr << "Original: 0x" << std::hex << original[i] << std::dec << endl;
+            cerr << "Result:   0x" << std::hex << result[i] << std::dec << endl;
+            assert(false);
+        }
+    }
+    cout << test_name << " passed." << endl;
+}
+
+void run_unit_tests(int bits) {
+    const int value_count = 1024; // Smaller size for unit tests
+    const int interleaved_count = 32;
+    const int operation_count = value_count / interleaved_count;
+    const int block_size = 32;
+    const int block_count = operation_count / block_size;
+
+    // Allocate device memory
+    uint32_t *d_original, *d_interleaved, *d_deinterleaved;
+    cudaMallocManaged(&d_original, value_count * sizeof(uint32_t));
+    cudaMallocManaged(&d_interleaved, value_count * sizeof(uint32_t));
+    cudaMallocManaged(&d_deinterleaved, value_count * sizeof(uint32_t));
+
+    // Initialize data
+    for (int i = 0; i < value_count; i++) {
+        d_original[i] = rand();
+    }
+
+    // CPU interleave followed by GPU de-interleave
+    if (bits == 1) {
+        cpu_interleave_1bit(d_original, d_interleaved, operation_count);
+        deinterleave_kernel_1bit<<<block_count, block_size>>>(d_interleaved, d_deinterleaved);
+    } else if (bits == 2) {
+        cpu_interleave_2bit(d_original, d_interleaved, operation_count);
+        deinterleave_kernel_2bit<<<block_count, block_size>>>(d_interleaved, d_deinterleaved);
+    } else if (bits == 4) {
+        cpu_interleave_4bit(d_original, d_interleaved, operation_count);
+        deinterleave_kernel_4bit<<<block_count, block_size>>>(d_interleaved, d_deinterleaved);
+    } else if (bits == 8) {
+        cpu_interleave_8bit(d_original, d_interleaved, operation_count);
+        deinterleave_kernel_8bit<<<block_count, block_size>>>(d_interleaved, d_deinterleaved);
+    }
+    cudaDeviceSynchronize();
+    verify_data(d_original, d_deinterleaved, value_count, "CPU interleave + GPU de-interleave (" + to_string(bits) + "-bit)");
+
+    // GPU interleave followed by CPU de-interleave
+    if (bits == 1) {
+        interleave_kernel_1bit<<<block_count, block_size>>>(d_original, d_interleaved);
+        cudaDeviceSynchronize();
+        cpu_deinterleave_1bit(d_interleaved, d_deinterleaved, operation_count);
+    } else if (bits == 2) {
+        interleave_kernel_2bit<<<block_count, block_size>>>(d_original, d_interleaved);
+        cudaDeviceSynchronize();
+        cpu_deinterleave_2bit(d_interleaved, d_deinterleaved, operation_count);
+    } else if (bits == 4) {
+        interleave_kernel_4bit<<<block_count, block_size>>>(d_original, d_interleaved);
+        cudaDeviceSynchronize();
+        cpu_deinterleave_4bit(d_interleaved, d_deinterleaved, operation_count);
+    } else if (bits == 8) {
+        interleave_kernel_8bit<<<block_count, block_size>>>(d_original, d_interleaved);
+        cudaDeviceSynchronize();
+        cpu_deinterleave_8bit(d_interleaved, d_deinterleaved, operation_count);
+    }
+    verify_data(d_original, d_deinterleaved, value_count, "GPU interleave + CPU de-interleave (" + to_string(bits) + "-bit)");
+
+    // GPU interleave followed by GPU de-interleave
+    if (bits == 1) {
+        interleave_kernel_1bit<<<block_count, block_size>>>(d_original, d_interleaved);
+        deinterleave_kernel_1bit<<<block_count, block_size>>>(d_interleaved, d_deinterleaved);
+    } else if (bits == 2) {
+        interleave_kernel_2bit<<<block_count, block_size>>>(d_original, d_interleaved);
+        deinterleave_kernel_2bit<<<block_count, block_size>>>(d_interleaved, d_deinterleaved);
+    } else if (bits == 4) {
+        interleave_kernel_4bit<<<block_count, block_size>>>(d_original, d_interleaved);
+        deinterleave_kernel_4bit<<<block_count, block_size>>>(d_interleaved, d_deinterleaved);
+    } else if (bits == 8) {
+        interleave_kernel_8bit<<<block_count, block_size>>>(d_original, d_interleaved);
+        deinterleave_kernel_8bit<<<block_count, block_size>>>(d_interleaved, d_deinterleaved);
+    }
+    cudaDeviceSynchronize();
+    verify_data(d_original, d_deinterleaved, value_count, "GPU interleave + GPU de-interleave (" + to_string(bits) + "-bit)");
+
+    // CPU interleave followed by CPU de-interleave
+    if (bits == 1) {
+        cpu_interleave_1bit(d_original, d_interleaved, operation_count);
+        cpu_deinterleave_1bit(d_interleaved, d_deinterleaved, operation_count);
+    } else if (bits == 2) {
+        cpu_interleave_2bit(d_original, d_interleaved, operation_count);
+        cpu_deinterleave_2bit(d_interleaved, d_deinterleaved, operation_count);
+    } else if (bits == 4) {
+        cpu_interleave_4bit(d_original, d_interleaved, operation_count);
+        cpu_deinterleave_4bit(d_interleaved, d_deinterleaved, operation_count);
+    } else if (bits == 8) {
+        cpu_interleave_8bit(d_original, d_interleaved, operation_count);
+        cpu_deinterleave_8bit(d_interleaved, d_deinterleaved, operation_count);
+    }
+    verify_data(d_original, d_deinterleaved, value_count, "CPU interleave + CPU de-interleave (" + to_string(bits) + "-bit)");
+
+    // Clean up
+    cudaFree(d_original);
+    cudaFree(d_interleaved);
+    cudaFree(d_deinterleaved);
+}
+
+
 int main() {
+    cout << "Running unit tests:" << endl;
+    run_unit_tests(1);
+    run_unit_tests(2);
+    run_unit_tests(4);
+    run_unit_tests(8);
+
     cout << "Running tests " << NUM_RUNS << " times each and reporting median times:" << endl << endl;
     run_test(1);
     run_test(2);
     run_test(4);
     run_test(8);
+
+    cout << "Running de-interleave tests " << NUM_RUNS << " times each and reporting median times:" << endl << endl;
+    run_deinterleave_test(1);
+    run_deinterleave_test(2);
+    run_deinterleave_test(4);
+    run_deinterleave_test(8);
 
     cout << "All tests passed!" << endl;
     return 0;
