@@ -98,6 +98,41 @@ static const int kHeaderBytes = 8;
 
     The result will be the original set of floating point numbers that can be
     read back to the CPU.
+
+
+    Discussion:
+
+    I believe this algorithm is a good compromise between speed, compression
+    ratio, and simplicity.
+
+    Floating-point values are quantized to a given epsilon.  This is done by
+    dividing by epsilon and rounding to the nearest integer.
+    Torch.Round style rounding is used to improve the quality of the rounding,
+    where it rounds towards the nearest even value (including 0).
+    The remaining operations are all lossless.
+
+    Subtracting subsequent values is a simple predictor, which is just one
+    option.  For example it could subtract future values or vertically adjacent
+    values.  However, all of these predictors are pretty similar in performance
+    and this is the most efficient option.  To improve further, the compressor
+    could consider alternative predictors and store the best one, but it would
+    slow down the algorithm and add a significant amount of complexity.
+    There's an example of this more complex algorithm here:
+    https://github.com/catid/Zdepth/blob/ac7c6d8e944d07be2404e5a1eaa04562595f3756/src/zdepth.cpp#L437 
+
+    Zig-Zag encoding is used, as described in https://lemire.me/blog/2022/11/25/making-all-your-integers-positive-with-zigzag-encoding/
+    This is a simple way to encode signed integers into unsigned integers,
+    so that the high bits are all zeros.
+
+    The exception list of a single largest value per quantization group is
+    inspired by https://github.com/lemire/FastPFor
+    specifically this part: https://github.com/lemire/FastPFor/blob/8ba17c93ed2c173caba839427858a16236833f77/headers/pfor.h#L306
+    To make it GPU friendly and simpler, this algorithm always has just one
+    exception per quantization group.  To motivate this, consider the case
+    where the values are similar to eachother but large.  In this case, the
+    first value will be much larger than the rest after subtracting neighbors.
+    If we make that first value an exception, then the rest of the values can
+    be packed together much more tightly.
 */
 
 
