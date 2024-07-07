@@ -262,6 +262,97 @@ __device__ void interleave_words_8bit(
 
 
 //------------------------------------------------------------------------------
+// GPU De-interleave Kernels
+
+__device__ void deinterleave_words_1bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output,
+    uint32_t bits)
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 32; i++) {
+        uint32_t result = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < bits; j++) {
+            result |= ((input[j] >> i) & 1) << j;
+        }
+        output[i] = result;
+    }
+}
+
+__device__ void deinterleave_words_2bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output,
+    uint32_t bits)
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 16; i++) {
+        uint32_t result_0 = 0, result_1 = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 16; j++) {
+            result_0 |= ((input[j*2] >> (i*2)) & 3) << (j*2);
+            result_1 |= ((input[j*2+1] >> (i*2)) & 3) << (j*2);
+        }
+        output[i] = result_0;
+        output[i + 16] = result_1;
+    }
+}
+
+__device__ void deinterleave_words_4bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output,
+    uint32_t bits)
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; i++) {
+        uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8; j++) {
+            result_0 |= ((input[j*4] >> (i*4)) & 0xF) << (j*4);
+            result_1 |= ((input[j*4+1] >> (i*4)) & 0xF) << (j*4);
+            result_2 |= ((input[j*4+2] >> (i*4)) & 0xF) << (j*4);
+            result_3 |= ((input[j*4+3] >> (i*4)) & 0xF) << (j*4);
+        }
+        output[i] = result_0;
+        output[i + 8] = result_1;
+        output[i + 16] = result_2;
+        output[i + 24] = result_3;
+    }
+}
+
+__device__ void deinterleave_words_8bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output,
+    uint32_t bits)
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 4; i++) {
+        uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
+        uint32_t result_4 = 0, result_5 = 0, result_6 = 0, result_7 = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            result_0 |= ((input[j*8] >> (i*8)) & 0xFF) << (j*8);
+            result_1 |= ((input[j*8+1] >> (i*8)) & 0xFF) << (j*8);
+            result_2 |= ((input[j*8+2] >> (i*8)) & 0xFF) << (j*8);
+            result_3 |= ((input[j*8+3] >> (i*8)) & 0xFF) << (j*8);
+            result_4 |= ((input[j*8+4] >> (i*8)) & 0xFF) << (j*8);
+            result_5 |= ((input[j*8+5] >> (i*8)) & 0xFF) << (j*8);
+            result_6 |= ((input[j*8+6] >> (i*8)) & 0xFF) << (j*8);
+            result_7 |= ((input[j*8+7] >> (i*8)) & 0xFF) << (j*8);
+        }
+        output[i] = result_0;
+        output[i + 4] = result_1;
+        output[i + 8] = result_2;
+        output[i + 12] = result_3;
+        output[i + 16] = result_4;
+        output[i + 20] = result_5;
+        output[i + 24] = result_6;
+        output[i + 28] = result_7;
+    }
+}
+
+
+//------------------------------------------------------------------------------
 // Compression Kernel
 
 __global__ void SZplus_compress_kernel_f32(
