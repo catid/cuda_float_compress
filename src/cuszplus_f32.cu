@@ -145,19 +145,119 @@ __device__ inline int32_t zigzag_decode(uint32_t x)
     return (x >> 1) ^ -(x & 1);
 }
 
-__device__ inline uint32_t pack_bits(
-    const uint32_t* const __restrict__ quant_group,
-    uint32_t bit_pos)
+
+//------------------------------------------------------------------------------
+// Interleave Kernels
+
+__device__ void interleave_words_1bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output,
+    uint32_t bits)
 {
-    uint8_t result = 0;
-    uint32_t mask = 1U << bit_pos;
-
     #pragma unroll
-    for (uint32_t j = 0; j < 8; ++j) {
-        result |= ((quant_group[j] & mask) != 0) << (7 - j);
-    }
+    for (uint32_t shift = 0; shift < bits; shift++) {
+        uint32_t mask = 1U << shift;
+        uint32_t result = (input[0] & mask) >> shift;
 
-    return result;
+        #pragma unroll
+        for (uint32_t i = 1; i < 32; ++i) {
+            result |= ((input[i] & mask) >> shift) << i;
+        }
+
+        output[shift] = result;
+    }
+}
+
+__device__ void interleave_words_2bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output,
+    uint32_t bits)
+{
+    #pragma unroll
+    for (uint32_t shift = 0; shift < bits; shift += 2) {
+        uint32_t result_0 = 0;
+        uint32_t result_1 = 0;
+        uint32_t mask = 0x3 << shift;
+
+        #pragma unroll
+        for (uint32_t i = 0; i < 16; ++i) {
+            uint32_t bits_0 = (input[i] & mask) >> shift;
+            uint32_t bits_1 = (input[i + 16] & mask) >> shift;
+            result_0 |= (bits_0 << (i * 2));
+            result_1 |= (bits_1 << (i * 2));
+        }
+
+        output[shift] = result_0;
+        output[shift + 1] = result_1;
+    }
+}
+
+__device__ void interleave_words_4bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output,
+    uint32_t bits)
+{
+    #pragma unroll
+    for (uint32_t shift = 0; shift < bits; shift += 4) {
+        uint32_t result_0 = 0;
+        uint32_t result_1 = 0;
+        uint32_t result_2 = 0;
+        uint32_t result_3 = 0;
+        uint32_t mask = 0xF << shift;
+
+        #pragma unroll
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t bits_0 = (input[i] & mask) >> shift;
+            uint32_t bits_1 = (input[i + 8] & mask) >> shift;
+            uint32_t bits_2 = (input[i + 16] & mask) >> shift;
+            uint32_t bits_3 = (input[i + 24] & mask) >> shift;
+            
+            result_0 |= (bits_0 << (i * 4));
+            result_1 |= (bits_1 << (i * 4));
+            result_2 |= (bits_2 << (i * 4));
+            result_3 |= (bits_3 << (i * 4));
+        }
+
+        output[shift] = result_0;
+        output[shift + 1] = result_1;
+        output[shift + 2] = result_2;
+        output[shift + 3] = result_3;
+    }
+}
+
+__device__ void interleave_words_8bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output,
+    uint32_t bits)
+{
+    #pragma unroll
+    for (uint32_t shift = 0; shift < bits; shift += 8) {
+        uint32_t mask = 0xFF << shift;
+
+        uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
+        uint32_t result_4 = 0, result_5 = 0, result_6 = 0, result_7 = 0;
+
+        #pragma unroll
+        for (uint32_t i = 0; i < 4; ++i) {
+            result_0 |= (((input[i] & mask) >> shift) << (i * 8));
+            result_1 |= (((input[i + 4] & mask) >> shift) << (i * 8));
+            result_2 |= (((input[i + 8] & mask) >> shift) << (i * 8));
+            result_3 |= (((input[i + 12] & mask) >> shift) << (i * 8));
+            result_4 |= (((input[i + 16] & mask) >> shift) << (i * 8));
+            result_5 |= (((input[i + 20] & mask) >> shift) << (i * 8));
+            result_6 |= (((input[i + 24] & mask) >> shift) << (i * 8));
+            result_7 |= (((input[i + 28] & mask) >> shift) << (i * 8));
+        }
+
+        output[shift] = result_0;
+        output[shift + 1] = result_1;
+        output[shift + 2] = result_2;
+        output[shift + 3] = result_3;
+        output[shift + 4] = result_4;
+        output[shift + 5] = result_5;
+        output[shift + 6] = result_6;
+        output[shift + 7] = result_7;
+    }
 }
 
 
@@ -248,15 +348,9 @@ __global__ void SZplus_compress_kernel_f32(
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
         const uint32_t bits = group_bits[i];
 
-        for (uint32_t j = 0; j < bits; j++) {
-            const uint32_t packed_data =
-                pack_bits(quant_group + i * QUANT_GROUP_SIZE,      j) |
-                pack_bits(quant_group + i * QUANT_GROUP_SIZE + 8,  j) << 8  |
-                pack_bits(quant_group + i * QUANT_GROUP_SIZE + 16, j) << 16 |
-                pack_bits(quant_group + i * QUANT_GROUP_SIZE + 24, j) << 24;
-
-            *compressed_words++ = packed_data;
-        }
+        // TBD: Try other interleave kernels
+        interleave_words_1bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+        compressed_words += bits;
     }
 }
 

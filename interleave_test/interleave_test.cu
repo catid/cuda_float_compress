@@ -14,9 +14,6 @@ using namespace std;
 //------------------------------------------------------------------------------
 // Constants
 
-// Function version is faster.
-#define ENABLE_FN_VERSION 1
-
 const int NUM_RUNS = 20;  // Number of times to run each test
 
 
@@ -46,6 +43,117 @@ double median(std::vector<double>& v) {
 
 
 //------------------------------------------------------------------------------
+// GPU Kernels
+
+__device__ void interleave_words_1bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output)
+{
+    #pragma unroll
+    for (uint32_t shift = 0; shift < 32; shift++) {
+        uint32_t mask = 1U << shift;
+        uint32_t result = (input[0] & mask) >> shift;
+
+        #pragma unroll
+        for (uint32_t i = 1; i < 32; ++i) {
+            result |= ((input[i] & mask) >> shift) << i;
+        }
+
+        output[shift] = result;
+    }
+}
+
+__device__ void interleave_words_2bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output)
+{
+    #pragma unroll
+    for (uint32_t shift = 0; shift < 32; shift += 2) {
+        uint32_t result_0 = 0;
+        uint32_t result_1 = 0;
+        uint32_t mask = 0x3 << shift;
+
+        #pragma unroll
+        for (uint32_t i = 0; i < 16; ++i) {
+            uint32_t bits_0 = (input[i] & mask) >> shift;
+            uint32_t bits_1 = (input[i + 16] & mask) >> shift;
+            result_0 |= (bits_0 << (i * 2));
+            result_1 |= (bits_1 << (i * 2));
+        }
+
+        output[shift] = result_0;
+        output[shift + 1] = result_1;
+    }
+}
+
+__device__ void interleave_words_4bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output)
+{
+    #pragma unroll
+    for (uint32_t shift = 0; shift < 32; shift += 4) {
+        uint32_t result_0 = 0;
+        uint32_t result_1 = 0;
+        uint32_t result_2 = 0;
+        uint32_t result_3 = 0;
+        uint32_t mask = 0xF << shift;
+
+        #pragma unroll
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t bits_0 = (input[i] & mask) >> shift;
+            uint32_t bits_1 = (input[i + 8] & mask) >> shift;
+            uint32_t bits_2 = (input[i + 16] & mask) >> shift;
+            uint32_t bits_3 = (input[i + 24] & mask) >> shift;
+            
+            result_0 |= (bits_0 << (i * 4));
+            result_1 |= (bits_1 << (i * 4));
+            result_2 |= (bits_2 << (i * 4));
+            result_3 |= (bits_3 << (i * 4));
+        }
+
+        output[shift] = result_0;
+        output[shift + 1] = result_1;
+        output[shift + 2] = result_2;
+        output[shift + 3] = result_3;
+    }
+}
+
+__device__ void interleave_words_8bit(
+    const uint32_t* const __restrict__ input,
+    uint32_t* const __restrict__ output)
+{
+    #pragma unroll
+    for (uint32_t shift = 0; shift < 32; shift += 8) {
+        uint32_t mask = 0xFF << shift;
+
+        uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
+        uint32_t result_4 = 0, result_5 = 0, result_6 = 0, result_7 = 0;
+
+        #pragma unroll
+        for (uint32_t i = 0; i < 4; ++i) {
+            result_0 |= (((input[i] & mask) >> shift) << (i * 8));
+            result_1 |= (((input[i + 4] & mask) >> shift) << (i * 8));
+            result_2 |= (((input[i + 8] & mask) >> shift) << (i * 8));
+            result_3 |= (((input[i + 12] & mask) >> shift) << (i * 8));
+            result_4 |= (((input[i + 16] & mask) >> shift) << (i * 8));
+            result_5 |= (((input[i + 20] & mask) >> shift) << (i * 8));
+            result_6 |= (((input[i + 24] & mask) >> shift) << (i * 8));
+            result_7 |= (((input[i + 28] & mask) >> shift) << (i * 8));
+        }
+
+        output[shift] = result_0;
+        output[shift + 1] = result_1;
+        output[shift + 2] = result_2;
+        output[shift + 3] = result_3;
+        output[shift + 4] = result_4;
+        output[shift + 5] = result_5;
+        output[shift + 6] = result_6;
+        output[shift + 7] = result_7;
+    }
+}
+
+
+//------------------------------------------------------------------------------
 // Interleave Kernel
 
 __global__ void interleave_kernel_1bit(
@@ -64,18 +172,7 @@ __global__ void interleave_kernel_1bit(
         words[j] = input[j];
     }
 
-    #pragma unroll
-    for (uint32_t shift = 0; shift < 32; shift++) {
-        uint32_t mask = 1U << shift;
-        uint32_t result = (words[0] & mask) >> shift;
-
-        #pragma unroll
-        for (uint32_t i = 1; i < 32; ++i) {
-            result |= ((words[i] & mask) >> shift) << i;
-        }
-
-        output[shift] = result;
-    }
+    interleave_words_1bit(words, output);
 }
 
 
@@ -119,22 +216,6 @@ void cpu_interleave_1bit(const uint32_t* input, uint32_t* output, int block_coun
 //------------------------------------------------------------------------------
 // GPU Interleave Kernel (2 bits at a time)
 
-#ifdef ENABLE_FN_VERSION
-
-__device__ inline uint32_t pack_2bits(const uint32_t* const __restrict__ words, uint32_t shift)
-{
-    uint32_t result = 0;
-    uint32_t mask = 0x3 << shift;
-
-    #pragma unroll
-    for (uint32_t i = 0; i < 16; ++i) {
-        uint32_t bits = (words[i] & mask) >> shift;
-        result |= (bits << (i * 2));
-    }
-
-    return result;
-}
-
 __global__ void interleave_kernel_2bit(
     const uint32_t* input,
     uint32_t* output)
@@ -151,51 +232,8 @@ __global__ void interleave_kernel_2bit(
         words[i] = input[i];
     }
 
-    #pragma unroll
-    for (uint32_t shift = 0; shift < 32; shift += 2) {
-        output[shift] = pack_2bits(words, shift);
-        output[shift + 1] = pack_2bits(words + 16, shift);
-    }
+    interleave_words_2bit(words, output);
 }
-
-#else
-
-__global__ void interleave_kernel_2bit(
-    const uint32_t* input,
-    uint32_t* output)
-{
-    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    input += thread_idx * 32;
-    output += thread_idx * 32;
-
-    // Copy input to local register array
-    uint32_t words[32];
-    #pragma unroll
-    for (uint32_t i = 0; i < 32; ++i) {
-        words[i] = input[i];
-    }
-
-    #pragma unroll
-    for (uint32_t shift = 0; shift < 32; shift += 2) {
-        uint32_t result_0 = 0;
-        uint32_t result_1 = 0;
-        uint32_t mask = 0x3 << shift;
-
-        #pragma unroll
-        for (uint32_t i = 0; i < 16; ++i) {
-            uint32_t bits_0 = (words[i] & mask) >> shift;
-            uint32_t bits_1 = (words[i + 16] & mask) >> shift;
-            result_0 |= (bits_0 << (i * 2));
-            result_1 |= (bits_1 << (i * 2));
-        }
-
-        output[shift] = result_0;
-        output[shift + 1] = result_1;
-    }
-}
-
-#endif
 
 
 //------------------------------------------------------------------------------
@@ -239,22 +277,6 @@ void cpu_interleave_2bit(const uint32_t* input, uint32_t* output, int block_coun
 //------------------------------------------------------------------------------
 // GPU Interleave Kernel (4 bits at a time)
 
-#ifdef ENABLE_FN_VERSION
-
-__device__ inline uint32_t pack_4bits(const uint32_t* const __restrict__ words, uint32_t shift)
-{
-    uint32_t result = 0;
-    uint32_t mask = 0xF << shift;
-
-    #pragma unroll
-    for (uint32_t i = 0; i < 8; ++i) {
-        uint32_t bits = (words[i] & mask) >> shift;
-        result |= (bits << (i * 4));
-    }
-
-    return result;
-}
-
 __global__ void interleave_kernel_4bit(
     const uint32_t* input,
     uint32_t* output)
@@ -271,62 +293,8 @@ __global__ void interleave_kernel_4bit(
         words[i] = input[i];
     }
 
-    #pragma unroll
-    for (uint32_t shift = 0; shift < 32; shift += 4) {
-        output[shift] = pack_4bits(words, shift);
-        output[shift + 1] = pack_4bits(words + 8, shift);
-        output[shift + 2] = pack_4bits(words + 16, shift);
-        output[shift + 3] = pack_4bits(words + 24, shift);
-    }
+    interleave_words_4bit(words, output);
 }
-
-#else
-
-__global__ void interleave_kernel_4bit(
-    const uint32_t* input,
-    uint32_t* output)
-{
-    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    input += thread_idx * 32;
-    output += thread_idx * 32;
-
-    // Copy input to local register array
-    uint32_t words[32];
-    #pragma unroll
-    for (uint32_t i = 0; i < 32; ++i) {
-        words[i] = input[i];
-    }
-
-    #pragma unroll
-    for (uint32_t shift = 0; shift < 32; shift += 4) {
-        uint32_t result_0 = 0;
-        uint32_t result_1 = 0;
-        uint32_t result_2 = 0;
-        uint32_t result_3 = 0;
-        uint32_t mask = 0xF << shift;
-
-        #pragma unroll
-        for (uint32_t i = 0; i < 8; ++i) {
-            uint32_t bits_0 = (words[i] & mask) >> shift;
-            uint32_t bits_1 = (words[i + 8] & mask) >> shift;
-            uint32_t bits_2 = (words[i + 16] & mask) >> shift;
-            uint32_t bits_3 = (words[i + 24] & mask) >> shift;
-            
-            result_0 |= (bits_0 << (i * 4));
-            result_1 |= (bits_1 << (i * 4));
-            result_2 |= (bits_2 << (i * 4));
-            result_3 |= (bits_3 << (i * 4));
-        }
-
-        output[shift] = result_0;
-        output[shift + 1] = result_1;
-        output[shift + 2] = result_2;
-        output[shift + 3] = result_3;
-    }
-}
-
-#endif
 
 
 //------------------------------------------------------------------------------
@@ -372,22 +340,6 @@ void cpu_interleave_4bit(const uint32_t* input, uint32_t* output, int block_coun
 //------------------------------------------------------------------------------
 // GPU Interleave Kernel (8 bits at a time)
 
-#ifdef ENABLE_FN_VERSION
-
-__device__ inline uint32_t pack_8bits(const uint32_t* const __restrict__ words, uint32_t shift)
-{
-    uint32_t result = 0;
-    uint32_t mask = 0xFF << shift;
-
-    #pragma unroll
-    for (uint32_t i = 0; i < 4; ++i) {
-        uint32_t bits = (words[i] & mask) >> shift;
-        result |= (bits << (i * 8));
-    }
-
-    return result;
-}
-
 __global__ void interleave_kernel_8bit(
     const uint32_t* input,
     uint32_t* output)
@@ -397,30 +349,6 @@ __global__ void interleave_kernel_8bit(
     input += thread_idx * 32;
     output += thread_idx * 32;
 
-    #pragma unroll
-    for (uint32_t shift = 0; shift < 32; shift += 8) {
-        output[shift] = pack_8bits(input, shift);
-        output[shift + 1] = pack_8bits(input + 4, shift);
-        output[shift + 2] = pack_8bits(input + 8, shift);
-        output[shift + 3] = pack_8bits(input + 12, shift);
-        output[shift + 4] = pack_8bits(input + 16, shift);
-        output[shift + 5] = pack_8bits(input + 20, shift);
-        output[shift + 6] = pack_8bits(input + 24, shift);
-        output[shift + 7] = pack_8bits(input + 28, shift);
-    }
-}
-
-#else
-
-__global__ void interleave_kernel_8bit(
-    const uint32_t* input,
-    uint32_t* output)
-{
-    const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    input += thread_idx * 32;
-    uint4* output_vec4 = reinterpret_cast<uint4*>(output + thread_idx * 32);
-
     // Copy input to local register array
     uint32_t words[32];
     #pragma unroll
@@ -428,31 +356,8 @@ __global__ void interleave_kernel_8bit(
         words[i] = input[i];
     }
 
-    #pragma unroll
-    for (uint32_t shift = 0; shift < 32; shift += 8) {
-        uint32_t mask = 0xFF << shift;
-
-        uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
-        uint32_t result_4 = 0, result_5 = 0, result_6 = 0, result_7 = 0;
-
-        #pragma unroll
-        for (uint32_t i = 0; i < 4; ++i) {
-            result_0 |= (((words[i] & mask) >> shift) << (i * 8));
-            result_1 |= (((words[i + 4] & mask) >> shift) << (i * 8));
-            result_2 |= (((words[i + 8] & mask) >> shift) << (i * 8));
-            result_3 |= (((words[i + 12] & mask) >> shift) << (i * 8));
-            result_4 |= (((words[i + 16] & mask) >> shift) << (i * 8));
-            result_5 |= (((words[i + 20] & mask) >> shift) << (i * 8));
-            result_6 |= (((words[i + 24] & mask) >> shift) << (i * 8));
-            result_7 |= (((words[i + 28] & mask) >> shift) << (i * 8));
-        }
-
-        output_vec4[shift / 4] = make_uint4(result_0, result_1, result_2, result_3);
-        output_vec4[shift / 4 + 1] = make_uint4(result_4, result_5, result_6, result_7);
-    }
+    interleave_words_8bit(words, output);
 }
-
-#endif
 
 
 //------------------------------------------------------------------------------
