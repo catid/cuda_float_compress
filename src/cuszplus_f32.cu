@@ -147,9 +147,9 @@ __device__ inline int32_t zigzag_decode(uint32_t x)
 
 
 //------------------------------------------------------------------------------
-// Interleave Kernels
+// GPU Kernels
 
-__device__ void interleave_words_1bit(
+__device__ inline void interleave_words_1bit(
     const uint32_t* const __restrict__ input,
     uint32_t* const __restrict__ output,
     uint32_t bits)
@@ -168,7 +168,7 @@ __device__ void interleave_words_1bit(
     }
 }
 
-__device__ void interleave_words_2bit(
+__device__ inline void interleave_words_2bit(
     const uint32_t* const __restrict__ input,
     uint32_t* const __restrict__ output,
     uint32_t bits)
@@ -192,7 +192,7 @@ __device__ void interleave_words_2bit(
     }
 }
 
-__device__ void interleave_words_4bit(
+__device__ inline void interleave_words_4bit(
     const uint32_t* const __restrict__ input,
     uint32_t* const __restrict__ output,
     uint32_t bits)
@@ -225,7 +225,7 @@ __device__ void interleave_words_4bit(
     }
 }
 
-__device__ void interleave_words_8bit(
+__device__ inline void interleave_words_8bit(
     const uint32_t* const __restrict__ input,
     uint32_t* const __restrict__ output,
     uint32_t bits)
@@ -264,7 +264,7 @@ __device__ void interleave_words_8bit(
 //------------------------------------------------------------------------------
 // GPU De-interleave Kernels
 
-__device__ void deinterleave_words_1bit(
+__device__ inline void deinterleave_words_1bit(
     const uint32_t* const __restrict__ input,
     uint32_t* const __restrict__ output,
     uint32_t bits)
@@ -280,7 +280,7 @@ __device__ void deinterleave_words_1bit(
     }
 }
 
-__device__ void deinterleave_words_2bit(
+__device__ inline void deinterleave_words_2bit(
     const uint32_t* const __restrict__ input,
     uint32_t* const __restrict__ output,
     uint32_t bits)
@@ -289,16 +289,16 @@ __device__ void deinterleave_words_2bit(
     for (uint32_t i = 0; i < 16; i++) {
         uint32_t result_0 = 0, result_1 = 0;
         #pragma unroll
-        for (uint32_t j = 0; j < 16; j++) {
-            result_0 |= ((input[j*2] >> (i*2)) & 3) << (j*2);
-            result_1 |= ((input[j*2+1] >> (i*2)) & 3) << (j*2);
+        for (uint32_t j = 0; j < bits; j += 2) {
+            result_0 |= ((input[j] >> (i*2)) & 3) << j;
+            result_1 |= ((input[j+1] >> (i*2)) & 3) << j;
         }
         output[i] = result_0;
         output[i + 16] = result_1;
     }
 }
 
-__device__ void deinterleave_words_4bit(
+__device__ inline void deinterleave_words_4bit(
     const uint32_t* const __restrict__ input,
     uint32_t* const __restrict__ output,
     uint32_t bits)
@@ -307,11 +307,11 @@ __device__ void deinterleave_words_4bit(
     for (uint32_t i = 0; i < 8; i++) {
         uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
         #pragma unroll
-        for (uint32_t j = 0; j < 8; j++) {
-            result_0 |= ((input[j*4] >> (i*4)) & 0xF) << (j*4);
-            result_1 |= ((input[j*4+1] >> (i*4)) & 0xF) << (j*4);
-            result_2 |= ((input[j*4+2] >> (i*4)) & 0xF) << (j*4);
-            result_3 |= ((input[j*4+3] >> (i*4)) & 0xF) << (j*4);
+        for (uint32_t j = 0; j < bits; j += 4) {
+            result_0 |= ((input[j] >> (i*4)) & 0xF) << j;
+            result_1 |= ((input[j+1] >> (i*4)) & 0xF) << j;
+            result_2 |= ((input[j+2] >> (i*4)) & 0xF) << j;
+            result_3 |= ((input[j+3] >> (i*4)) & 0xF) << j;
         }
         output[i] = result_0;
         output[i + 8] = result_1;
@@ -320,7 +320,7 @@ __device__ void deinterleave_words_4bit(
     }
 }
 
-__device__ void deinterleave_words_8bit(
+__device__ inline void deinterleave_words_8bit(
     const uint32_t* const __restrict__ input,
     uint32_t* const __restrict__ output,
     uint32_t bits)
@@ -330,15 +330,15 @@ __device__ void deinterleave_words_8bit(
         uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
         uint32_t result_4 = 0, result_5 = 0, result_6 = 0, result_7 = 0;
         #pragma unroll
-        for (uint32_t j = 0; j < 4; j++) {
-            result_0 |= ((input[j*8] >> (i*8)) & 0xFF) << (j*8);
-            result_1 |= ((input[j*8+1] >> (i*8)) & 0xFF) << (j*8);
-            result_2 |= ((input[j*8+2] >> (i*8)) & 0xFF) << (j*8);
-            result_3 |= ((input[j*8+3] >> (i*8)) & 0xFF) << (j*8);
-            result_4 |= ((input[j*8+4] >> (i*8)) & 0xFF) << (j*8);
-            result_5 |= ((input[j*8+5] >> (i*8)) & 0xFF) << (j*8);
-            result_6 |= ((input[j*8+6] >> (i*8)) & 0xFF) << (j*8);
-            result_7 |= ((input[j*8+7] >> (i*8)) & 0xFF) << (j*8);
+        for (uint32_t j = 0; j < bits; j += 8) {
+            result_0 |= ((input[j] >> (i*8)) & 0xFF) << j;
+            result_1 |= ((input[j+1] >> (i*8)) & 0xFF) << j;
+            result_2 |= ((input[j+2] >> (i*8)) & 0xFF) << j;
+            result_3 |= ((input[j+3] >> (i*8)) & 0xFF) << j;
+            result_4 |= ((input[j+4] >> (i*8)) & 0xFF) << j;
+            result_5 |= ((input[j+5] >> (i*8)) & 0xFF) << j;
+            result_6 |= ((input[j+6] >> (i*8)) & 0xFF) << j;
+            result_7 |= ((input[j+7] >> (i*8)) & 0xFF) << j;
         }
         output[i] = result_0;
         output[i + 4] = result_1;
