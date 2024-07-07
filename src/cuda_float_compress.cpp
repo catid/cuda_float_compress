@@ -35,7 +35,7 @@ torch::Tensor cuszplus_compress(torch::Tensor input, float errorBound) {
     return cmpBytes.slice(0, cmpSize);
 }
 
-torch::Tensor cuszplus_decompress(torch::Tensor compressed, size_t nbEle, float errorBound) {
+torch::Tensor cuszplus_decompress(torch::Tensor compressed) {
     if (!compressed.is_contiguous()) {
         compressed = compressed.contiguous();
     }
@@ -51,7 +51,6 @@ torch::Tensor cuszplus_decompress(torch::Tensor compressed, size_t nbEle, float 
     const size_t cmpSize = compressed.numel();
 
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(compressed.device());
-    torch::Tensor result = torch::empty(nbEle, options);
 
     FloatDecompressor decompressor;
 
@@ -61,6 +60,9 @@ torch::Tensor cuszplus_decompress(torch::Tensor compressed, size_t nbEle, float 
         throw std::runtime_error("decompressor.Decompress failed");
     }
 
+    // FIXME: Copy result back or allocate internally.
+
+    torch::Tensor result = torch::empty(1, options);
     return result;
 }
 

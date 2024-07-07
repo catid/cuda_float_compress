@@ -75,7 +75,7 @@ def main():
         else:
             print("ERROR: Decompression failed. Unable to compare.")
 
-        decompressed_params = cuda_float_compress.cuszplus_decompress(compressed_params, num_elements, error_bound)
+        decompressed_params = cuda_float_compress.cuszplus_decompress(compressed_params)
 
         mse = torch.mean((raw_data - decompressed_params) ** 2)
         ratio = raw_data.numel() * 4.0 / compressed_params.numel()

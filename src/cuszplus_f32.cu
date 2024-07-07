@@ -22,7 +22,7 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4;
 #define BLOCK_FLOAT_COUNT (BLOCK_SIZE * THREAD_FLOAT_COUNT)
 #define BLOCK_PARAM_COUNT (BLOCK_SIZE * THREAD_GROUP_COUNT)
 #define PARAM_SIZE (4 + 1 + 1)
-#define INTERLEAVE_BITS 1
+#define INTERLEAVE_BITS 4
 
 /*
     Header:
@@ -758,30 +758,18 @@ bool FloatDecompressor::Decompress(
     // Prepare input buffer for zstd
     ZSTD_inBuffer input = { data, static_cast<size_t>(compressed_bytes), kHeaderBytes + block_count * 4 };
 
-    // Allocate device memory for decompressed data
-    float* decompressed_floats = nullptr;
-    cudaError_t err = cudaMallocAsync((void**)&decompressed_floats, sizeof(float) * float_count, stream);
+    // Allocate CUDA managed memory for decompressed blocks
+    uint8_t* managed_decompressed_blocks = nullptr;
+    cudaError_t err = cudaMallocManaged((void**)&managed_decompressed_blocks, block_count * block_bytes, cudaMemAttachGlobal);
     if (err != cudaSuccess) {
-        cerr << "ERROR: Failed to allocate device memory for decompressed data: " << cudaGetErrorString(err) << endl;
+        cerr << "ERROR: Failed to allocate CUDA managed memory for decompressed blocks: " << cudaGetErrorString(err) << endl;
         return false;
     }
-    CallbackScope decompressed_floats_cleanup([&]() { cudaFreeAsync(decompressed_floats, stream); });
-
-    // Allocate device memory for compressed blocks
-    uint8_t* d_compressed_blocks = nullptr;
-    err = cudaMallocAsync((void**)&d_compressed_blocks, block_count * block_bytes, stream);
-    if (err != cudaSuccess) {
-        cerr << "ERROR: Failed to allocate device memory for compressed blocks: " << cudaGetErrorString(err) << endl;
-        return false;
-    }
-    CallbackScope d_compressed_blocks_cleanup([&]() { cudaFreeAsync(d_compressed_blocks, stream); });
-
-    // Allocate host memory for temporary storage of decompressed blocks
-    std::vector<uint8_t> h_decompressed_block(block_bytes);
+    CallbackScope managed_decompressed_blocks_cleanup([&]() { cudaFree(managed_decompressed_blocks); });
 
     // Decompress each block
     for (int i = 0; i < block_count; ++i) {
-        ZSTD_outBuffer output = { h_decompressed_block.data(), block_bytes, 0 };
+        ZSTD_outBuffer output = { managed_decompressed_blocks + i * block_bytes, block_bytes, 0 };
 
         while (output.pos < block_used_words[i] * 4 + BLOCK_PARAM_COUNT * PARAM_SIZE) {
             size_t const result = ZSTD_decompressStream(zds, &output, &input);
@@ -791,15 +779,16 @@ bool FloatDecompressor::Decompress(
             }
             if (result == 0) break;
         }
-
-        // Copy decompressed block to device
-        err = cudaMemcpyAsync(d_compressed_blocks + i * block_bytes, h_decompressed_block.data(), 
-                              output.pos, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess) {
-            cerr << "ERROR: Failed to copy decompressed block " << i << " to device: " << cudaGetErrorString(err) << endl;
-            return false;
-        }
     }
+
+    // Allocate device memory for decompressed floats
+    float* decompressed_floats = nullptr;
+    err = cudaMallocAsync((void**)&decompressed_floats, sizeof(float) * float_count, stream);
+    if (err != cudaSuccess) {
+        cerr << "ERROR: Failed to allocate device memory for decompressed floats: " << cudaGetErrorString(err) << endl;
+        return false;
+    }
+    CallbackScope decompressed_floats_cleanup([&]() { cudaFreeAsync(decompressed_floats, stream); });
 
     // Launch decompression kernel
     dim3 blockSize(BLOCK_SIZE);
@@ -807,7 +796,7 @@ bool FloatDecompressor::Decompress(
     cerr << "INFO: Launching decompression kernel with grid size " << gridSize.x << " and block size " << blockSize.x << endl;
     SZplus_decompress_kernel_f32<<<gridSize, blockSize, 0, stream>>>(
         decompressed_floats,
-        d_compressed_blocks,
+        managed_decompressed_blocks,
         block_used_words.data(),
         epsilon);
 
