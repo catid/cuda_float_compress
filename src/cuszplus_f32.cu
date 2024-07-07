@@ -5,8 +5,9 @@
 #include <cuda_runtime.h>
 #include <cub/cub.cuh> // CUB from CUDA Toolkit
 
-// FIXME: REMOVE THIS
-#include <stdio.h>
+#include <iostream>
+using namespace std;
+
 
 //------------------------------------------------------------------------------
 // Constants
@@ -94,6 +95,9 @@ static const int kHeaderBytes = 8;
             X[i] = X[i] + X[i - 1]
 
             X[i] = X[i] * epsilon
+
+    The result will be the original set of floating point numbers that can be
+    read back to the CPU.
 */
 
 
@@ -268,7 +272,10 @@ bool FloatCompressor::Compress(
     // Copy data to device
     float* original_data = nullptr;
     cudaError_t err = cudaMalloc((void**)&original_data, sizeof(float)*float_count);
-    if (err != cudaSuccess) { return -1; }
+    if (err != cudaSuccess) {
+        cerr << "cudaMalloc failed: err=" << cudaGetErrorString(err) << " float_count=" << float_count << endl;
+        return -1;
+    }
     CallbackScope original_data_cleanup([&]() { cudaFree(original_data); });
     cudaMemcpy(original_data, float_data, sizeof(float)*float_count, cudaMemcpyHostToDevice);
 
@@ -278,7 +285,10 @@ bool FloatCompressor::Compress(
     // Create output buffer
     uint8_t* compressed_blocks = nullptr;
     cudaError_t err = cudaMallocManaged((void**)&compressed_blocks, block_count*block_bytes + block_count*sizeof(uint32_t));
-    if (err != cudaSuccess) { return -1; }
+    if (err != cudaSuccess) {
+        cerr << "cudaMallocManaged failed: err=" << cudaGetErrorString(err) << " block_count=" << block_count << endl;
+        return -1;
+    }
     CallbackScope original_data_cleanup([&]() { cudaFree(compressed_blocks); });
     uint32_t* block_used_words = reinterpret_cast<uint32_t*>(compressed_blocks + block_count*block_bytes);
 
@@ -329,6 +339,7 @@ bool FloatCompressor::Compress(
         }
     }
 
+    // For each compressed block:
     for (int i = 0; i < block_count; i++)
     {
         const uint32_t used_words = block_used_words[i];
@@ -362,9 +373,7 @@ bool FloatCompressor::Compress(
         }
     }
 
-    // Resize the result vector to the actual compressed size
     Result.resize(output.pos);
-
     return true;
 }
 
@@ -373,19 +382,15 @@ bool FloatCompressor::Compress(
 // Decompression Kernel
 
 __global__ void SZplus_decompress_kernel_f32(
-    float* const __restrict__ decData,
-    const uint8_t* const __restrict__ cmpData,
-    volatile uint32_t* const __restrict__ cmpOffset,
-    volatile int* const __restrict__ flag,
-    const float eb,
-    const size_t nbEle)
+    float* const __restrict__ decompressed_floats,
+    const uint8_t* __restrict__ compressed_blocks,
+    volatile uint32_t* const __restrict__ compressed_block_offsets,
+    const float epsilon)
 {
-    const int tid = threadIdx.x;
-    const int idx = blockIdx.x * blockDim.x + tid;
-    const int block_num = dec_chunk_f32/32;
-    const int start_idx = idx * dec_chunk_f32;
-    const int start_block_idx = start_idx/32;
-    const int rate_ofs = (nbEle+31)/32;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const uint32_t block_offset = compressed_block_offsets[blockIdx.x];
+    compressed_blocks += block_offset;
 
     uint32_t absQuant[32];
     int fixed_rate[block_num];
@@ -415,11 +420,6 @@ __global__ void SZplus_decompress_kernel_f32(
             for(int i=0; i<32; i++) absQuant[i] = 0;
             for(int i=0; i<fixed_rate[j]; i++)
             {
-                tmp_char0 = cmpData[cmp_byte_ofs++];
-                tmp_char1 = cmpData[cmp_byte_ofs++];
-                tmp_char2 = cmpData[cmp_byte_ofs++];
-                tmp_char3 = cmpData[cmp_byte_ofs++];
-
                 absQuant[0] |= ((tmp_char0 >> 7) & 0x00000001) << i;
                 absQuant[1] |= ((tmp_char0 >> 6) & 0x00000001) << i;
                 absQuant[2] |= ((tmp_char0 >> 5) & 0x00000001) << i;
@@ -481,5 +481,53 @@ bool FloatDecompressor::Decompress(
     const void* compressed_data,
     int compressed_bytes)
 {
-    
+    if (compressed_bytes < kHeaderBytes) {
+        return false;
+    }
+
+
+
+    const size_t r = ZSTD_decompress(
+        decompressed,
+        original_bytes,
+        compressed_data,
+        compressed_bytes);
+
+    if (ZSTD_isError(r) || r != (size_t)original_bytes) {
+        LOG_ERROR() << "Decompressor: Failed to decompress: r=" << r
+            << " original_bytes=" << original_bytes << " err=" << ZSTD_getErrorName(r);
+        return false;
+    }
+
+    uint32_t* unpacked = reinterpret_cast<uint32_t*>( Result.data() );
+
+    for (uint32_t i = 0; i < original_tokens; ++i) {
+        uint8_t unpacked_word[8] = {0};
+        for (uint32_t j = 0; j < token_bytes; j++) {
+            unpacked_word[j] = decompressed[i + j * original_tokens];
+        }
+
+        unpacked[i] = read_uint32_le(unpacked_word);
+    }
+
+    // Copy data to device
+    float* original_data = nullptr;
+    cudaError_t err = cudaMalloc((void**)&original_data, sizeof(float)*float_count);
+    if (err != cudaSuccess) { return -1; }
+    CallbackScope original_data_cleanup([&]() { cudaFree(original_data); });
+    cudaMemcpy(original_data, float_data, sizeof(float)*float_count, cudaMemcpyHostToDevice);
+
+    int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
+    const int block_bytes = BLOCK_PARAM_COUNT*PARAM_SIZE + BLOCK_FLOAT_COUNT*sizeof(float);
+
+    // Create output buffer
+    uint8_t* compressed_blocks = nullptr;
+    cudaError_t err = cudaMallocManaged((void**)&compressed_blocks, block_count*block_bytes + block_count*sizeof(uint32_t));
+    if (err != cudaSuccess) { return -1; }
+    CallbackScope original_data_cleanup([&]() { cudaFree(compressed_blocks); });
+    uint32_t* block_used_words = reinterpret_cast<uint32_t*>(compressed_blocks + block_count*block_bytes);
+
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+    CallbackScope stream_cleanup([&]() { cudaStreamDestroy(stream); });
 }
