@@ -595,6 +595,8 @@ __global__ void SZplus_decompress(
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int block_float_start = thread_idx * THREAD_FLOAT_COUNT;
 
+    // FIXME: Fix the block calculation here - Should be using offset list
+
     const uint8_t* block_data = compressed_blocks + blockIdx.x * (BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float));
     const uint32_t* compressed_words = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * PARAM_SIZE);
 
@@ -818,27 +820,26 @@ bool DecompressFloats(
     }
 
     // Read header
-    const uint8_t* data = static_cast<const uint8_t*>(compressed_data);
-    uint32_t magic = read_uint32_le(data);
+    const uint8_t* header_data = static_cast<const uint8_t*>(compressed_data);
+    const uint32_t magic = read_uint32_le(header_data);
     if (magic != kMagic) {
         cerr << "ERROR: Invalid magic number. Expected 0x" << hex << kMagic << ", but got 0x" << magic << dec << endl;
         return false;
     }
-    float epsilon = read_float_le(data + 4);
-    int float_count = read_uint32_le(data + 8);
+    const float epsilon = read_float_le(header_data + 4);
+    const int float_count = read_uint32_le(header_data + 8);
 
     cerr << "INFO: Decompressing " << float_count << " floats with epsilon " << epsilon << endl;
 
     // Calculate block count
-    int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
+    const int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
 
     cerr << "INFO: Block count: " << block_count << ", Block bytes: " << BLOCK_BYTES << endl;
 
     // Read block used words
     std::vector<uint32_t> block_used_words(block_count);
-    for (int i = 0; i < block_count; ++i) {
-        block_used_words[i] = read_uint32_le(data + kHeaderBytes + i * 4);
-    }
+    const uint32_t* header_words = reinterpret_cast<const uint32_t*>(header_data + kHeaderBytes);
+    cpu_deinterleave_4bit(header_words, block_used_words.data(), block_count, 32);
 
     // Initialize zstd
     ZSTD_DStream* zds = ZSTD_createDStream();
@@ -854,9 +855,6 @@ bool DecompressFloats(
         return false;
     }
 
-    // Prepare input buffer for zstd
-    ZSTD_inBuffer input = { data, static_cast<size_t>(compressed_bytes), kHeaderBytes + block_count * 4 };
-
     // Allocate CUDA managed memory for decompressed blocks
     uint8_t* managed_decompressed_blocks = nullptr;
     cudaError_t err = cudaMallocManaged((void**)&managed_decompressed_blocks, block_count * BLOCK_BYTES, cudaMemAttachGlobal);
@@ -867,16 +865,20 @@ bool DecompressFloats(
     CallbackScope managed_decompressed_blocks_cleanup([&]() { cudaFree(managed_decompressed_blocks); });
 
     // Decompress each block
+    ZSTD_inBuffer input = { compressed_data, static_cast<size_t>(compressed_bytes), kHeaderBytes + block_count * 4 };
     for (int i = 0; i < block_count; ++i) {
         ZSTD_outBuffer output = { managed_decompressed_blocks + i * BLOCK_BYTES, BLOCK_BYTES, 0 };
 
+        // FIXME: Check this!
         while (output.pos < block_used_words[i] * 4 + BLOCK_PARAM_COUNT * PARAM_SIZE) {
             size_t const result = ZSTD_decompressStream(zds, &output, &input);
             if (ZSTD_isError(result)) {
                 cerr << "ERROR: ZSTD decompression failed for block " << i << ": " << ZSTD_getErrorName(result) << endl;
                 return false;
             }
-            if (result == 0) break;
+            if (result == 0) {
+                break;
+            }
         }
     }
 
