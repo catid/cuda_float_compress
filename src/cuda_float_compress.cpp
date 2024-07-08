@@ -17,10 +17,10 @@ torch::Tensor cuszplus_compress(torch::Tensor input, float epsilon) {
     }
 
     const int float_count = static_cast<int>(input.numel());
-    int compresed_buffer_size = GetCompressedBufferSize(float_count);
+    int compressed_buffer_size = GetCompressedBufferSize(float_count);
 
     auto options = torch::TensorOptions().dtype(torch::kUInt8).device(input.device());
-    torch::Tensor compresed_buffer = torch::empty(compresed_buffer_size, options);
+    torch::Tensor compresed_buffer = torch::empty(compressed_buffer_size, options);
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
@@ -30,14 +30,14 @@ torch::Tensor cuszplus_compress(torch::Tensor input, float epsilon) {
         input.is_cuda(),
         float_count,
         compresed_buffer.data_ptr<uint8_t>(),
-        compresed_buffer_size,
+        compressed_buffer_size,
         epsilon);
 
     if (!success) {
         throw std::runtime_error("compressor.Compress failed: float_count=" + std::to_string(float_count));
     }
 
-    return compresed_buffer.slice(0, compresed_buffer_size);
+    return compresed_buffer.slice(0, compressed_buffer_size);
 }
 
 torch::Tensor cuszplus_decompress(torch::Tensor compressed) {
