@@ -60,6 +60,9 @@ if(NOT TARGET torch_library)
 endif()
 
 add_subdirectory(pybind11)
+
+set(ZSTD_BUILD_PROGRAMS OFF)
+set(ZSTD_BUILD_TESTS OFF)
 add_subdirectory(zstd/build/cmake)
 
 # Configure CUDA after finding Torch to avoid conflicts
