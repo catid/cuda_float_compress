@@ -24,7 +24,7 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4 + 4; // see below for format
 #define BLOCK_PARAM_COUNT (BLOCK_SIZE * THREAD_GROUP_COUNT)
 #define PARAM_SIZE (4 + 1 + 1)
 #define BLOCK_BYTES (BLOCK_PARAM_COUNT*PARAM_SIZE + BLOCK_FLOAT_COUNT*sizeof(float))
-#define INTERLEAVE_BITS 4
+#define INTERLEAVE_BITS 1
 
 /*
     Header:
@@ -194,20 +194,9 @@ struct CallbackScope {
     std::function<void()> func;
 };
 
-__device__ inline uint32_t bit_count(uint32_t x)
-{
-    return (sizeof(uint32_t)*8) - __clz(x);
-}
-
-__device__ inline uint32_t zigzag_encode(uint32_t x)
-{
-    return (x << 1) ^ (x >> 31);
-}
-
-__device__ inline int32_t zigzag_decode(uint32_t x)
-{
-    return (x >> 1) ^ -(x & 1);
-}
+#define BIT_COUNT(x) ( 32 - __clz(x) )
+#define ZIGZAG_ENCODE(x) (((x) << 1) ^ (x >> 31))
+#define ZIGZAG_DECODE(x) ((x) >> 1) ^ -((int32_t)(x) & 1)
 
 
 //------------------------------------------------------------------------------
@@ -517,10 +506,10 @@ __global__ void SZplus_compress(
             const int32_t delta = quant - prev_quant;
             prev_quant = quant;
 
-            const uint32_t zig_quant = zigzag_encode(delta);
+            const uint32_t zig_quant = ZIGZAG_ENCODE(delta);
             quant_group[i * QUANT_GROUP_SIZE + j] = zig_quant;
 
-            // Update max_quant and max2_quant
+            // Update max_quant (largest) and max2_quant (second largest)
             if (zig_quant > max_quant) {
                 max2_quant = max_quant;
                 max_quant = zig_quant;
@@ -531,10 +520,10 @@ __global__ void SZplus_compress(
         }
 
         // Number of bits to represent second largest and smaller quantized values
-        const uint32_t bits = ROUND_UP_POW2(bit_count(max2_quant), INTERLEAVE_BITS);
+        const uint32_t bits = ROUND_UP_POW2(BIT_COUNT(max2_quant), INTERLEAVE_BITS);
 
         // Increment write count for this quantization group
-        used_words += bits * QUANT_GROUP_SIZE / sizeof(uint32_t);
+        used_words += bits;
 
         group_bits[i] = static_cast<uint8_t>(bits);
 
@@ -638,7 +627,7 @@ __global__ void SZplus_decompress(
                 decompressed_floats[j] = 0.f;
             }
             // Special case: The max value may be the only non-zero value.
-            decompressed_floats[max_index] = zigzag_decode(max_high_bits);
+            decompressed_floats[max_index] = ZIGZAG_DECODE(max_high_bits);
         } else {
 #if INTERLEAVE_BITS == 1
             deinterleave_words_1bit(compressed_words, quant_group, bits);
@@ -656,7 +645,7 @@ __global__ void SZplus_decompress(
             quant_group[max_index] |= max_high_bits;
 
             for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
-                quant_value += zigzag_decode(quant_group[j]);
+                quant_value += ZIGZAG_DECODE(quant_group[j]);
                 decompressed_floats[j] = quant_value * epsilon;
             }
         }
@@ -707,13 +696,15 @@ bool CompressFloats(
 
     // Create output buffer
     uint8_t* packed_blocks = nullptr;
-    cudaError_t err = cudaMallocAsync((void**)&packed_blocks, block_count*BLOCK_BYTES + block_count*sizeof(uint32_t), stream);
+    cudaError_t err = cudaMallocManaged((void**)&packed_blocks, block_count*BLOCK_BYTES + block_count*sizeof(uint32_t), cudaMemAttachGlobal);
     if (err != cudaSuccess) {
         cerr << "cudaMallocAsync failed: err=" << cudaGetErrorString(err) << " block_count=" << block_count << endl;
         return false;
     }
-    CallbackScope original_comp_cleanup([&]() { cudaFreeAsync(packed_blocks, stream); });
+    CallbackScope original_comp_cleanup([&]() { cudaFree(packed_blocks); });
     uint32_t* block_used_words = reinterpret_cast<uint32_t*>(packed_blocks + block_count*BLOCK_BYTES);
+
+    cudaMemset(packed_blocks, 0, block_count*BLOCK_BYTES + block_count*sizeof(uint32_t));
 
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
@@ -747,6 +738,7 @@ bool CompressFloats(
     uint32_t uncompressed_bytes = kHeaderBytes + block_count * sizeof(uint32_t);
     for (int i = 0; i < block_count; i++) {
         uncompressed_bytes += BLOCK_PARAM_COUNT * PARAM_SIZE + block_used_words[i] * sizeof(uint32_t);
+        cerr << "INFO: Block " << i << " used " << block_used_words[i] << " words" << endl;
     }
 
     // Prepare header
@@ -763,10 +755,9 @@ bool CompressFloats(
     for (int i = 0; i < block_count; i++)
     {
         const uint32_t used_words = block_used_words[i];
-        const uint8_t* block_data = packed_blocks + BLOCK_BYTES * i;
         const uint32_t block_used_bytes = BLOCK_PARAM_COUNT*PARAM_SIZE + used_words * sizeof(uint32_t);
 
-        ZSTD_inBuffer input = { block_data, block_used_bytes, 0 };
+        ZSTD_inBuffer input = { packed_blocks + BLOCK_BYTES * i, block_used_bytes, 0 };
         while (input.pos < input.size) {
             size_t const compressResult = ZSTD_compressStream(zcs, &output, &input);
             if (ZSTD_isError(compressResult)) {
@@ -843,13 +834,14 @@ bool DecompressFloats(
     // Read header
     const uint8_t* header_data = static_cast<const uint8_t*>(compressed_data);
     const uint32_t magic = read_uint32_le(header_data);
+    const uint32_t uncompressed_bytes = read_uint32_le(header_data + 4);
+    const float epsilon = read_float_le(header_data + 8);
+    const int float_count = read_uint32_le(header_data + 12);
+
     if (magic != kMagic) {
         cerr << "ERROR: Invalid magic number. Expected 0x" << hex << kMagic << ", but got 0x" << magic << dec << endl;
         return false;
     }
-    const uint32_t uncompressed_bytes = read_uint32_le(header_data + 4);
-    const float epsilon = read_float_le(header_data + 8);
-    const int float_count = read_uint32_le(header_data + 12);
 
     cerr << "INFO: Decompressing " << float_count << " floats with epsilon " << epsilon << endl;
 
@@ -887,7 +879,7 @@ bool DecompressFloats(
     cpu_deinterleave_4bit(header_words, block_used_words, block_count, 32);
 
     // Decompress each block
-    ZSTD_inBuffer input = { compressed_data, static_cast<size_t>(compressed_bytes), kHeaderBytes + block_count * 4 };
+    ZSTD_inBuffer input = { compressed_data + kHeaderBytes + block_count * sizeof(uint32_t), static_cast<size_t>(compressed_bytes), 0 };
     ZSTD_outBuffer output = { managed_decompressed_blocks, uncompressed_bytes, 0 };
     while (output.pos < uncompressed_bytes) {
         size_t const result = ZSTD_decompressStream(zds, &output, &input);
