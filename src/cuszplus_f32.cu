@@ -15,7 +15,7 @@ static const int kZstdCompressionLevel = 1;
 static const uint32_t kMagic = 0xCA7DD007;
 static const uint32_t kHeaderBytes = 4 + 4 + 4;
 
-#define BLOCK_SIZE 256
+#define BLOCK_SIZE 512
 #define QUANT_GROUP_SIZE 32
 #define THREAD_GROUP_COUNT 4
 #define THREAD_FLOAT_COUNT (THREAD_GROUP_COUNT * QUANT_GROUP_SIZE)
@@ -181,6 +181,10 @@ inline float read_float_le(const void* buffer) {
 
 //------------------------------------------------------------------------------
 // Tools
+
+// Round up to the next power of 2
+#define ROUND_UP_POW2(x, pow2) \
+    (((x) + ((pow2) - 1)) & ~((pow2) - 1))
 
 struct CallbackScope {
     CallbackScope(std::function<void()> func) : func(func) {}
@@ -485,7 +489,6 @@ __global__ void SZplus_compress(
     uint8_t* __restrict__ compressed_data)
 {
     using BlockScan = cub::BlockScan<uint32_t, BLOCK_SIZE>;
-    using BlockAdjacentDifferenceT = cub::BlockAdjacentDifference<int32_t, BLOCK_SIZE>;
     __shared__ typename BlockScan::TempStorage temp_storage;
 
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -526,7 +529,7 @@ __global__ void SZplus_compress(
         }
 
         // Number of bits to represent second largest and smaller quantized values
-        const uint32_t bits = bit_count(max2_quant);
+        const uint32_t bits = ROUND_UP_POW2(bit_count(max2_quant), INTERLEAVE_BITS);
 
         // Increment write count for this quantization group
         used_words += bits * QUANT_GROUP_SIZE / sizeof(uint32_t);
@@ -537,8 +540,8 @@ __global__ void SZplus_compress(
 
         // For each QUANT_GROUP_SIZE, write the number of bits, index of max value, and high bits
         uint8_t* __restrict__ params = compressed_data + BLOCK_PARAM_COUNT * threadIdx.x + i;
-        params[0] = static_cast<uint8_t>(max_index);
-        params[BLOCK_PARAM_COUNT] = static_cast<uint8_t>(bits);
+        params[0] = static_cast<uint8_t>(bits);
+        params[BLOCK_PARAM_COUNT] = static_cast<uint8_t>(max_index);
         params[BLOCK_PARAM_COUNT*2] = static_cast<uint8_t>(max_high_bits);
         params[BLOCK_PARAM_COUNT*3] = static_cast<uint8_t>(max_high_bits >> 8);
         params[BLOCK_PARAM_COUNT*4] = static_cast<uint8_t>(max_high_bits >> 16);
@@ -547,7 +550,6 @@ __global__ void SZplus_compress(
 
     __syncthreads(); // Barrier for smem reuse
 
-    // Inclusive Sum (using CUB)
     BlockScan block_scan(temp_storage);
     uint32_t offset = 0;
     block_scan.ExclusiveSum(used_words, offset);
@@ -564,6 +566,7 @@ __global__ void SZplus_compress(
     compressed_words += offset;
 
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
+        // Note: This code also works for bits=0
         const uint32_t bits = group_bits[i];
 
 #if INTERLEAVE_BITS == 1
@@ -587,60 +590,78 @@ __global__ void SZplus_compress(
 // Decompression Kernel
 
 __global__ void SZplus_decompress(
-    float* const __restrict__ decompressed_floats,
+    float* __restrict__ decompressed_floats,
     const uint8_t* __restrict__ compressed_blocks,
-    const uint32_t* const __restrict__ block_used_words,
+    const uint32_t* const __restrict__ block_offsets,
     float epsilon)
 {
+    using BlockScan = cub::BlockScan<uint32_t, BLOCK_SIZE>;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int block_float_start = thread_idx * THREAD_FLOAT_COUNT;
+    decompressed_floats += thread_idx * THREAD_FLOAT_COUNT;
 
-    // FIXME: Fix the block calculation here - Should be using offset list
+    compressed_blocks += block_offsets[blockIdx.x];
 
-    const uint8_t* block_data = compressed_blocks + blockIdx.x * (BLOCK_PARAM_COUNT * PARAM_SIZE + BLOCK_FLOAT_COUNT * sizeof(float));
-    const uint32_t* compressed_words = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * PARAM_SIZE);
+    uint32_t word_offsets[THREAD_GROUP_COUNT];
+    for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
+        const uint8_t* __restrict__ params = compressed_blocks + BLOCK_PARAM_COUNT * threadIdx.x + i;
+        word_offsets[i] = ROUND_UP_POW2(params[0], INTERLEAVE_BITS);
+    }
 
-    uint32_t quant_group[THREAD_FLOAT_COUNT];
-    int32_t prev_quant = 0;
+    __syncthreads(); // Barrier for smem reuse
+
+    BlockScan block_scan(temp_storage);
+    block_scan.ExclusiveSum(word_offsets, word_offsets);
+
+    __syncthreads(); // Barrier for smem reuse
+
+    const uint32_t* compressed_words = reinterpret_cast<const uint32_t*>(compressed_blocks + BLOCK_PARAM_COUNT * PARAM_SIZE);
+
+    uint32_t quant_group[QUANT_GROUP_SIZE];
+    int32_t quant_value = 0;
 
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
-        const uint8_t max_index = block_data[THREAD_GROUP_COUNT * threadIdx.x + i];
-        const uint8_t bits = block_data[BLOCK_PARAM_COUNT + THREAD_GROUP_COUNT * threadIdx.x + i];
-        const uint32_t* high_bits = reinterpret_cast<const uint32_t*>(block_data + BLOCK_PARAM_COUNT * 2);
-        const uint32_t max_quant = (high_bits[THREAD_GROUP_COUNT * threadIdx.x + i] << bits) | ((1 << bits) - 1);
+        const uint8_t* __restrict__ params = compressed_blocks + BLOCK_PARAM_COUNT * threadIdx.x + i;
+        uint32_t bits = ROUND_UP_POW2(params[0], INTERLEAVE_BITS);
+        uint32_t max_index = params[BLOCK_PARAM_COUNT];
+        uint32_t max_high_bits = static_cast<uint32_t>(params[BLOCK_PARAM_COUNT*2])      |
+                        (static_cast<uint32_t>(params[BLOCK_PARAM_COUNT*3]) <<  8) |
+                        (static_cast<uint32_t>(params[BLOCK_PARAM_COUNT*4]) << 16) |
+                        (static_cast<uint32_t>(params[BLOCK_PARAM_COUNT*5]) << 24);
+        max_high_bits <<= bits;
 
         if (bits == 0) {
             for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
-                quant_group[i * QUANT_GROUP_SIZE + j] = 0;
+                decompressed_floats[j] = 0.f;
             }
+            // Special case: The max value may be the only non-zero value.
+            decompressed_floats[max_index] = zigzag_decode(max_high_bits);
         } else {
 #if INTERLEAVE_BITS == 1
-            deinterleave_words_1bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+            deinterleave_words_1bit(compressed_words, quant_group, bits);
 #elif INTERLEAVE_BITS == 2
-            deinterleave_words_2bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+            deinterleave_words_2bit(compressed_words, quant_group, bits);
 #elif INTERLEAVE_BITS == 4
-            deinterleave_words_4bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+            deinterleave_words_4bit(compressed_words, quant_group, bits);
 #elif INTERLEAVE_BITS == 8
-            deinterleave_words_8bit(compressed_words, quant_group + i * QUANT_GROUP_SIZE, bits);
+            deinterleave_words_8bit(compressed_words, quant_group, bits);
 #else
 #error "Invalid INTERLEAVE_BITS value. Must be 1, 2, 4, or 8."
 #endif
+
+            // Restore the max value
+            quant_group[max_index] |= max_high_bits;
+
+            for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
+                quant_value += zigzag_decode(quant_group[j]);
+                decompressed_floats[j] = quant_value * epsilon;
+            }
         }
 
-        compressed_words += bits;
-
-        // Restore the max value
-        quant_group[i * QUANT_GROUP_SIZE + max_index] = max_quant;
-
-        // Zig-zag decode and inverse delta encoding
-        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
-            int32_t curr_quant = zigzag_decode(quant_group[i * QUANT_GROUP_SIZE + j]) + prev_quant;
-            prev_quant = curr_quant;
-
-            int float_index = block_float_start + i * QUANT_GROUP_SIZE + j;
-            decompressed_floats[float_index] = curr_quant * epsilon;
-        }
-    }
+        compressed_words += bits * QUANT_GROUP_SIZE;
+        decompressed_floats += QUANT_GROUP_SIZE;
+    } // next quantization group
 }
 
 
