@@ -42,17 +42,46 @@
 #endif
 
 /*
-    Algorithm:
+    We expect to process about this many floats per CUDA thread:
+    DELTA_RESET_INTERVAL_GROUPS = 32 * 4
+    QUANT_GROUP_SIZE = 32 (working with 32-bit input data)
 
-        For each set of 32 words:
-            Subtract neighboring words
-            Zigzag encode
+    Best compression ratio is achieved using the following settings:
+    INTERLEAVE_BITS = 2
+    ENABLE_SECOND_PASS
+    INTERLEAVE_ONLY_LOCAL = 256 * DELTA_RESET_INTERVAL_GROUPS
+    ZSTD_COMPRESSION_LEVEL = 1
 
-    Results:
+    Despite all the tweaks to the single-pass algorithm,
+    this simpler algorithm achieves the best result.
 
-    Do not interleave groups, do not use varlen bits, do not use high bits:
+    ENABLE_SECOND_PASS: Compression ratio: 2.94478
+    ENABLE_VARLEN_BITS: Compression ratio: 2.73035
 
-    1-bit interleave:
+    This is fortunate because the second-pass algorithm is much simpler
+    and faster.
+
+    With INTERLEAVE_ONLY_LOCAL = 64 * DELTA_RESET_INTERVAL_GROUPS,
+    Compression ratio: 2.85601.  Still much better than VARLEN algorithm.
+    With INTERLEAVE_ONLY_LOCAL = 128 * DELTA_RESET_INTERVAL_GROUPS,
+    Compression ratio: 2.94232.  So there is improvement for blocks of 128.
+    So when doing the CUDA version we should use block_size >= 128.
+
+    ENABLE_SECOND_PASS performs the same with or without INTERLEAVE_ONLY_LOCAL,
+    due to the way that Zstd starts a new block every 128K bytes of input data.
+
+    For ENABLE_SECOND_PASS:
+    INTERLEAVE_BITS = 1: Compression ratio: 2.92763
+    INTERLEAVE_BITS = 2: Compression ratio: 2.94478
+    INTERLEAVE_BITS = 4: Compression ratio: 2.93508
+    INTERLEAVE_BITS = 8: Compression ratio: 2.89294
+
+    Interestingly 1-bit interleaving performs worse than 2/4.
+    This is fortunate because 2+ bit interleaving is faster when implemented
+    in CUDA.
+
+    For the above preferred algorithm, Zstd compression level 1 performs best.
+    This is fortunate because it's also faster.
 */
 
 
