@@ -13,7 +13,7 @@ using namespace std;
 
 static const int kZstdCompressionLevel = 1;
 
-static const uint32_t kMagic = 0xCA7DD007;
+static const uint32_t kMagic = 0x00010203;
 static const uint32_t kHeaderBytes = 4 + 4 + 4 + 4; // see below for format
 
 #define BLOCK_SIZE 512
@@ -32,6 +32,9 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4 + 4; // see below for format
         DecompressedBytes(4 bytes)
         Epsilon(4 bytes)
         FloatCount(4 bytes)
+
+    All of the following data is compressed:
+
         Block 0 used words(4 bytes)
         Block 1 used words(4 bytes)
         ...
@@ -406,71 +409,6 @@ __device__ inline void deinterleave_words_8bit(
 
 
 //------------------------------------------------------------------------------
-// CPU Version (4 bits at a time)
-
-// Helper function to pack 4 bits from 8 input words into a single output word
-uint32_t cpu_pack_4bits(const uint32_t* input, uint32_t shift) {
-    uint32_t result = 0;
-    uint32_t mask = 0xF << shift;
-    
-    for (int i = 0; i < 8; ++i) {
-        // Extract 4 bits at shift position from each input word
-        uint32_t bits = (input[i] & mask) >> shift;
-        
-        // Place these 4 bits in the correct position in the result
-        result |= (bits << (i * 4));
-    }
-    
-    return result;
-}
-
-// Main interleave function
-void cpu_interleave_4bit(const uint32_t* input, uint32_t* output, int block_count, int bits) {
-    for (int block = 0; block < block_count; ++block) {
-        // Pointer to the start of the current input block
-        const uint32_t* block_input = input + (block * 32);
-        
-        // Pointer to the start of the current output block
-        uint32_t* block_output = output + (block * bits);
-        
-        // For each 4-bit position in the 32-bit words
-        for (int shift = 0; shift < bits; shift += 4) {
-            // Pack 4 bits at this position from all 32 input words in the current block
-            block_output[shift] = cpu_pack_4bits(block_input, shift);
-            block_output[shift + 1] = cpu_pack_4bits(block_input + 8, shift);
-            block_output[shift + 2] = cpu_pack_4bits(block_input + 16, shift);
-            block_output[shift + 3] = cpu_pack_4bits(block_input + 24, shift);
-        }
-    }
-}
-
-
-//------------------------------------------------------------------------------
-// CPU De-interleave Functions
-
-void cpu_deinterleave_4bit(const uint32_t* input, uint32_t* output, int block_count, int low_bits) {
-    for (int block = 0; block < block_count; ++block) {
-        const uint32_t* block_input = input + (block * low_bits);
-        uint32_t* block_output = output + (block * 32);
-        
-        for (int i = 0; i < 8; ++i) {
-            uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
-            for (int j = 0; j < low_bits; j += 4) {
-                result_0 |= ((block_input[j] >> (i*4)) & 0xF) << j;
-                result_1 |= ((block_input[j+1] >> (i*4)) & 0xF) << j;
-                result_2 |= ((block_input[j+2] >> (i*4)) & 0xF) << j;
-                result_3 |= ((block_input[j+3] >> (i*4)) & 0xF) << j;
-            }
-            block_output[i] = result_0;
-            block_output[i + 8] = result_1;
-            block_output[i + 16] = result_2;
-            block_output[i + 24] = result_3;
-        }
-    }
-}
-
-
-//------------------------------------------------------------------------------
 // Compression Kernel
 
 __global__ void SZplus_compress(
@@ -662,7 +600,7 @@ __global__ void SZplus_decompress(
 int GetCompressedBufferSize(int float_count)
 {
     const int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
-    return kHeaderBytes + block_count * sizeof(uint32_t) + block_count * BLOCK_BYTES;
+    return kHeaderBytes + ZSTD_compressBound(block_count * sizeof(uint32_t) + block_count * BLOCK_BYTES);
 }
 
 bool CompressFloats(
@@ -747,11 +685,19 @@ bool CompressFloats(
     write_uint32_le(compressed_buffer + 4, uncompressed_bytes);
     write_float_le(compressed_buffer + 8, epsilon);
     write_uint32_le(compressed_buffer + 12, float_count);
-    uint32_t* header_words = reinterpret_cast<uint32_t*>(compressed_buffer + kHeaderBytes);
-    cpu_interleave_4bit(block_used_words, header_words, block_count, 32);
+
+    ZSTD_outBuffer output = { compressed_buffer + header_size, (unsigned)(compressed_bytes - header_size), 0 };
+
+    // Write list of used words for each block (interleaved)
+    {
+        uint32_t* header_words = reinterpret_cast<uint32_t*>(compressed_buffer + kHeaderBytes);
+        cpu_interleave_4bit(block_used_words, header_words, block_count, 32);
+
+        ZSTD_inBuffer input = { packed_blocks + BLOCK_BYTES * i, block_used_bytes, 0 };
+
+    }
 
     // For each compressed block:
-    ZSTD_outBuffer output = { compressed_buffer + header_size, (unsigned)(compressed_bytes - header_size), 0 };
     for (int i = 0; i < block_count; i++)
     {
         const uint32_t used_words = block_used_words[i];
@@ -866,17 +812,12 @@ bool DecompressFloats(
 
     // Allocate CUDA managed memory for decompressed blocks
     uint8_t* managed_decompressed_blocks = nullptr;
-    cudaError_t err = cudaMallocManaged((void**)&managed_decompressed_blocks, uncompressed_bytes + block_count * sizeof(uint32_t), cudaMemAttachGlobal);
+    cudaError_t err = cudaMallocManaged((void**)&managed_decompressed_blocks, uncompressed_bytes, cudaMemAttachGlobal);
     if (err != cudaSuccess) {
         cerr << "ERROR: Failed to allocate CUDA managed memory for decompressed blocks: " << cudaGetErrorString(err) << endl;
         return false;
     }
     CallbackScope managed_decompressed_blocks_cleanup([&]() { cudaFree(managed_decompressed_blocks); });
-
-    // Read block used words
-    uint32_t* block_used_words = reinterpret_cast<uint32_t*>(managed_decompressed_blocks + uncompressed_bytes);
-    const uint32_t* header_words = reinterpret_cast<const uint32_t*>(header_data + kHeaderBytes);
-    cpu_deinterleave_4bit(header_words, block_used_words, block_count, 32);
 
     // Decompress each block
     ZSTD_inBuffer input = { compressed_data + kHeaderBytes + block_count * sizeof(uint32_t), static_cast<size_t>(compressed_bytes), 0 };
@@ -891,6 +832,11 @@ bool DecompressFloats(
             break;
         }
     }
+
+    // Read block used words
+    uint32_t* block_used_words = reinterpret_cast<uint32_t*>(managed_decompressed_blocks);
+    const uint32_t* header_words = reinterpret_cast<const uint32_t*>(header_data + kHeaderBytes);
+    cpu_deinterleave_4bit(header_words, block_used_words, block_count, 32);
 
     // Launch decompression kernel
     dim3 blockSize(BLOCK_SIZE);
