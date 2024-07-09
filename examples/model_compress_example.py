@@ -55,33 +55,10 @@ def main():
 
         compressed_params = cuda_float_compress.cuszplus_compress(raw_data, error_bound)
 
-        print(f"compressed_params = {compressed_params}")
-
-        zcomp = compress_tensor_zstd(compressed_params)
-
-        dcomp = decompress_tensor_zstd(zcomp, compressed_params.numel())
-
-        # Check if dcomp matches the input compressed_params
-        if dcomp is not None:
-            is_match = torch.all(dcomp == compressed_params)
-            if is_match:
-                print("Decompressed data matches the input compressed data.")
-            else:
-                print("WARNING: Decompressed data does not match the input compressed data!")
-                # You can add more detailed comparison here if needed
-                mismatch_count = torch.sum(dcomp != compressed_params)
-                print(f"Number of mismatched elements: {mismatch_count}")
-        else:
-            print("ERROR: Decompression failed. Unable to compare.")
-
         decompressed_params = cuda_float_compress.cuszplus_decompress(compressed_params)
 
         mse = torch.mean((raw_data - decompressed_params) ** 2)
         ratio = raw_data.numel() * 4.0 / compressed_params.numel()
-        zratio = raw_data.numel() * 4.0 / len(zcomp)
-        # Emulate applying Zstd selectively (usually helps for larger tensors)
-        if zratio > ratio:
-            ratio = zratio
         print(f"Mean Squared Error after compression/decompression: {mse.item()} Ratio: {ratio:.2f}")
 
 if __name__ == "__main__":

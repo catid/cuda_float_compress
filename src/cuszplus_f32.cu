@@ -14,7 +14,7 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
 
 #define BLOCK_SIZE 256
 #define QUANT_GROUP_SIZE 32
-#define THREAD_GROUP_COUNT 2
+#define THREAD_GROUP_COUNT 4
 #define INTERLEAVE_BITS 2
 #define ZSTD_COMPRESSION_LEVEL 1
 
@@ -540,7 +540,7 @@ bool CompressFloats(
     write_float_le(compressed_buffer + 8, epsilon);
 
     size_t const compressed_size = ZSTD_compress(
-        compressed_buffer, compressed_bytes,
+        compressed_buffer + kHeaderBytes, compressed_bytes - kHeaderBytes,
         packed_blocks, block_count * BLOCK_BYTES,
         ZSTD_COMPRESSION_LEVEL);
     if (ZSTD_isError(compressed_size)) {
@@ -548,7 +548,7 @@ bool CompressFloats(
         return false;
     }
 
-    compressed_bytes = static_cast<int>(compressed_size);
+    compressed_bytes = static_cast<int>(kHeaderBytes + compressed_size);
     return true;
 }
 
