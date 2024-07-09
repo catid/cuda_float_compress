@@ -53,7 +53,6 @@ def main():
         # Set error bound for compression (adjust as needed)
         error_bound = 0.00001
 
-        num_elements = raw_data.numel()
         compressed_params = cuda_float_compress.cuszplus_compress(raw_data, error_bound)
 
         print(f"compressed_params = {compressed_params}")

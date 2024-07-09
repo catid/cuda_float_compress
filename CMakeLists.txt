@@ -4,7 +4,7 @@ project(cuda_float_compress LANGUAGES CXX CUDA)
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release;RelWithDebInfo" CACHE STRING "" FORCE)
 
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE RelWithDebInfo)
+    set(CMAKE_BUILD_TYPE Debug)
 endif()
 
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
@@ -75,6 +75,11 @@ set(CMAKE_CUDA_FLAGS_INIT "-std=c++17 -allow-unsupported-compiler")
 set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} -g -O2")
 set(CMAKE_CUDA_ARCHITECTURES all-major)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xptxas -Werror -Xptxas --warn-on-spills")
+
+#if(CMAKE_BUILD_TYPE MATCHES "Debug")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -O0")
+    message(STATUS "Setting CUDA debug flags")
+#endif()
 
 pybind11_add_module(cuda_float_compress
     src/cuda_float_compress.cpp

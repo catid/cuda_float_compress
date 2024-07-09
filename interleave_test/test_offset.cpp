@@ -9,22 +9,22 @@ using namespace std;
 
 #define THREAD_FLOAT_COUNT (THREAD_GROUP_COUNT * QUANT_GROUP_SIZE)
 #define BLOCK_FLOAT_COUNT (BLOCK_SIZE * THREAD_FLOAT_COUNT)
+#define INTERLEAVE_STRIDE (BLOCK_SIZE * THREAD_GROUP_COUNT)
 
 int main()
 {
     std::vector<int> visits(BLOCK_FLOAT_COUNT, 0);
 
     for (int i = 0; i < BLOCK_SIZE; i++) {
-        uint32_t start = i * THREAD_FLOAT_COUNT * QUANT_GROUP_SIZE;
-        int offset = (start % BLOCK_FLOAT_COUNT) + (start / BLOCK_FLOAT_COUNT);
 
-        cout << "--- " << offset << ", i=" << i << ":" << endl;
+        cout << "--- i=" << i << ":" << endl;
 
-        for (int j = 0; j < THREAD_FLOAT_COUNT; j++) {
-            int addr = (offset + j * QUANT_GROUP_SIZE) % BLOCK_FLOAT_COUNT;
-
-            cout << "    " << addr << endl;
-            visits[addr]++;
+        for (int j = 0; j < THREAD_GROUP_COUNT; j++) {
+            for (int k = 0; k < QUANT_GROUP_SIZE; k++) {
+                int addr = i * THREAD_GROUP_COUNT + j + k * INTERLEAVE_STRIDE;
+                cout << "    " << addr << endl;
+                visits[addr]++;
+            }
         }
     }
 

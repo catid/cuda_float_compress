@@ -14,12 +14,13 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
 
 #define BLOCK_SIZE 256
 #define QUANT_GROUP_SIZE 32
-#define THREAD_GROUP_COUNT 4
+#define THREAD_GROUP_COUNT 2
 #define INTERLEAVE_BITS 2
 #define ZSTD_COMPRESSION_LEVEL 1
 
 #define THREAD_FLOAT_COUNT (THREAD_GROUP_COUNT * QUANT_GROUP_SIZE)
 #define BLOCK_FLOAT_COUNT (BLOCK_SIZE * THREAD_FLOAT_COUNT)
+#define INTERLEAVE_STRIDE (BLOCK_SIZE * THREAD_GROUP_COUNT)
 #define BLOCK_BYTES (BLOCK_FLOAT_COUNT * 4)
 
 /*
@@ -362,56 +363,64 @@ __device__ inline void deinterleave_words_8bit(
 
 __global__ void SZplus_compress(
     const float* __restrict__ original_data,
+    int float_count,
     float epsilon,
     uint32_t* __restrict__ compressed_words)
 {
-    // All interleaved words for this thread block
-    __shared__ uint32_t shared_words[BLOCK_FLOAT_COUNT];
-
     // Local registers for interleaved bits for this thread
     uint32_t thread_words[THREAD_FLOAT_COUNT];
 
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     original_data += thread_idx * THREAD_FLOAT_COUNT;
+    float_count -= thread_idx * THREAD_FLOAT_COUNT;
+    compressed_words += blockIdx.x * BLOCK_FLOAT_COUNT;
 
     // Quantize, delta, zig-zag encode
     epsilon = 1.0f / epsilon;
     int32_t prev = 0;
-    for (int i = 0; i < THREAD_FLOAT_COUNT; i++) {
-        const int32_t quant = __float2int_rn(original_data[i] * epsilon);
+    int j = 0;
+    for (; j < THREAD_FLOAT_COUNT && j < float_count; j++) {
+        const int32_t quant = __float2int_rn(original_data[j] * epsilon);
         const int32_t delta = quant - prev;
         prev = quant;
-        thread_words[i] = ZIGZAG_ENCODE(delta);
+        thread_words[j] = ZIGZAG_ENCODE(delta);
     }
+    for (; j < THREAD_FLOAT_COUNT; j++) {
+        thread_words[j] = 0;
+    }
+
+    compressed_words += threadIdx.x * THREAD_GROUP_COUNT;
 
     // Interleave bits for words from this thread into shared memory
     #pragma unroll
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
+        uint32_t shuffled_words[QUANT_GROUP_SIZE];
+
 #if INTERLEAVE_BITS == 1
-        interleave_words_1bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
+        interleave_words_1bit(
+            thread_words + i * QUANT_GROUP_SIZE,
+            shuffled_words);
 #elif INTERLEAVE_BITS == 2
-        interleave_words_2bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
+        interleave_words_2bit(
+            thread_words + i * QUANT_GROUP_SIZE,
+            shuffled_words);
 #elif INTERLEAVE_BITS == 4
-        interleave_words_4bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
+        interleave_words_4bit(
+            thread_words + i * QUANT_GROUP_SIZE,
+            shuffled_words);
 #elif INTERLEAVE_BITS == 8
-        interleave_words_8bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
+        interleave_words_8bit(
+            thread_words + i * QUANT_GROUP_SIZE,
+            shuffled_words);
 #else
 #error "Invalid INTERLEAVE_BITS value. Must be 1, 2, 4, or 8."
 #endif
-    }
 
-    compressed_words += blockIdx.x * BLOCK_FLOAT_COUNT;
-
-    // Wait for shared memory to be ready
-    __syncthreads();
-
-    // Interleave words for this block
-    const uint32_t start = threadIdx.x * THREAD_FLOAT_COUNT * QUANT_GROUP_SIZE;
-    const int offset = (start % BLOCK_FLOAT_COUNT) + (start / BLOCK_FLOAT_COUNT);
-
-    #pragma unroll
-    for (int i = 0; i < THREAD_FLOAT_COUNT; i++) {
-        compressed_words[i] = shared_words[offset + i * QUANT_GROUP_SIZE];
+        #pragma unroll
+        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
+            compressed_words[j * INTERLEAVE_STRIDE] = shuffled_words[j];
+        }
+        compressed_words++;
     }
 }
 
@@ -424,47 +433,35 @@ __global__ void SZplus_decompress(
     const uint32_t* __restrict__ compressed_words,
     float epsilon)
 {
-    // All interleaved words for this thread block
-    __shared__ uint32_t shared_words[BLOCK_FLOAT_COUNT];
-
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     decompressed_floats += thread_idx * THREAD_FLOAT_COUNT;
-    compressed_words += threadIdx.x * THREAD_FLOAT_COUNT;
-
-    // De-interleave words for this block into shared memory
-    const uint32_t start = threadIdx.x * THREAD_FLOAT_COUNT * QUANT_GROUP_SIZE;
-    const int offset = (start % BLOCK_FLOAT_COUNT) + (start / BLOCK_FLOAT_COUNT);
-
-    #pragma unroll
-    for (int i = 0; i < THREAD_FLOAT_COUNT; i++) {
-        shared_words[offset + i * QUANT_GROUP_SIZE] = compressed_words[i];
-    }
-
-    // Wait for shared memory to be ready
-    __syncthreads();
+    compressed_words += threadIdx.x * THREAD_GROUP_COUNT;
 
     int32_t value = 0;
 
+    #pragma unroll
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
-        // Copy the shared memory data for this thread into local registers
-        uint32_t interleaved_words[QUANT_GROUP_SIZE];
-        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
-            interleaved_words[j] = shared_words[threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE + j];
-        }
+        uint32_t shuffled_words[QUANT_GROUP_SIZE];
 
-        uint32_t deinterleaved_words[QUANT_GROUP_SIZE];
+        #pragma unroll
+        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
+            shuffled_words[j] = compressed_words[j * INTERLEAVE_STRIDE];
+        }
+        compressed_words++;
+
+        uint32_t quant_words[QUANT_GROUP_SIZE];
 #if INTERLEAVE_BITS == 1
-        deinterleave_words_1bit(interleaved_words, deinterleaved_words);
+        deinterleave_words_1bit(shuffled_words, quant_words);
 #elif INTERLEAVE_BITS == 2
-        deinterleave_words_2bit(interleaved_words, deinterleaved_words);
+        deinterleave_words_2bit(shuffled_words, quant_words);
 #elif INTERLEAVE_BITS == 4
-        deinterleave_words_4bit(interleaved_words, deinterleaved_words);
+        deinterleave_words_4bit(shuffled_words, quant_words);
 #elif INTERLEAVE_BITS == 8
-        deinterleave_words_8bit(interleaved_words, deinterleaved_words);
+        deinterleave_words_8bit(shuffled_words, quant_words);
 #endif
 
         for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
-            value += ZIGZAG_DECODE(deinterleaved_words[j]);
+            value += ZIGZAG_DECODE(quant_words[j]);
             decompressed_floats[j] = value * epsilon;
         }
 
@@ -497,6 +494,8 @@ bool CompressFloats(
         return false;
     }
 
+    cout << "INFO: Compressing " << float_count << " floats with epsilon " << epsilon << endl;
+
     // If it's not a device pointer, we need to copy the data to the device
     float* d_original_data = nullptr;
     if (!is_device_ptr) {
@@ -523,8 +522,9 @@ bool CompressFloats(
 
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
-    SZplus_compress<<<gridSize, blockSize, BLOCK_BYTES, stream>>>(
+    SZplus_compress<<<gridSize, blockSize, 0, stream>>>(
         float_data,
+        float_count,
         epsilon,
         packed_blocks);
 
@@ -628,7 +628,7 @@ bool DecompressFloats(
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
     cerr << "INFO: Launching decompression kernel with grid size " << gridSize.x << " and block size " << blockSize.x << endl;
-    SZplus_decompress<<<gridSize, blockSize, BLOCK_BYTES, stream>>>(
+    SZplus_decompress<<<gridSize, blockSize, 0, stream>>>(
         decompressed_floats,
         compressed_words,
         epsilon);
