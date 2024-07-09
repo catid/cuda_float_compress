@@ -389,8 +389,6 @@ __global__ void SZplus_compress(
 
     #pragma unroll
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
-        //block_words[threadIdx.x * THREAD_FLOAT_COUNT + i] = zig_delta;
-
 #if INTERLEAVE_BITS == 1
         interleave_words_1bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
 #elif INTERLEAVE_BITS == 2
@@ -408,7 +406,8 @@ __global__ void SZplus_compress(
 
     __syncthreads(); // Barrier for smem
 
-    int offset = threadIdx.x * QUANT_GROUP_SIZE * THREAD_FLOAT_COUNT % BLOCK_FLOAT_COUNT;
+    uint32_t start = threadIdx.x * THREAD_FLOAT_COUNT * QUANT_GROUP_SIZE;
+    int offset = (start % BLOCK_FLOAT_COUNT) + (start / BLOCK_FLOAT_COUNT);
 
     #pragma unroll
     for (int i = 0; i < THREAD_FLOAT_COUNT; i++) {
