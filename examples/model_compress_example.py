@@ -56,7 +56,7 @@ def main():
     original_model = copy.deepcopy(model.state_dict())
 
     t0 = time.time()
-    error_bound = 0.0002
+    error_bound = 0.00001
     original_params = flatten_params(model)
     compressed_params = cuda_float_compress.cuszplus_compress(original_params, error_bound)
     t1 = time.time()

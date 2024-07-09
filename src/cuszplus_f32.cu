@@ -37,7 +37,7 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
         First quantize (int32_t) each float by dividing by epsilon:
             X[i] = Torch.Round( Float[i] / epsilon )
 
-        Within each GPU thread, subtract consective floats
+        Within each GPU thread, subtract consecutive floats
         for sets of THREAD_GROUP_COUNT * QUANT_GROUP_SIZE floats:
             X[i] = X[i] - X[i - 1]
 
