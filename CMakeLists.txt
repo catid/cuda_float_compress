@@ -76,10 +76,10 @@ set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} -g -O2")
 set(CMAKE_CUDA_ARCHITECTURES all-major)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xptxas -Werror -Xptxas --warn-on-spills")
 
-#if(CMAKE_BUILD_TYPE MATCHES "Debug")
+if(CMAKE_BUILD_TYPE MATCHES "Debug")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -O0")
     message(STATUS "Setting CUDA debug flags")
-#endif()
+endif()
 
 pybind11_add_module(cuda_float_compress
     src/cuda_float_compress.cpp

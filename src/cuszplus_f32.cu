@@ -500,17 +500,15 @@ bool CompressFloats(
         return false;
     }
 
-    cout << "INFO: Compressing " << float_count << " floats with epsilon " << epsilon << endl;
-
     // If it's not a device pointer, we need to copy the data to the device
     float* d_original_data = nullptr;
     if (!is_device_ptr) {
-        cudaError_t err = cudaMallocAsync((void**)&d_original_data, sizeof(float)*float_count, stream);
+        cudaError_t err = cudaMallocAsync((void**)&d_original_data, sizeof(float) * float_count, stream);
         if (err != cudaSuccess) {
             cerr << "cudaMalloc failed: err=" << cudaGetErrorString(err) << " float_count=" << float_count << endl;
             return false;
         }
-        cudaMemcpyAsync(d_original_data, float_data, sizeof(float)*float_count, cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_original_data, float_data, sizeof(float) * float_count, cudaMemcpyHostToDevice, stream);
         float_data = d_original_data;
     }
     CallbackScope original_data_cleanup([&]() { if (d_original_data) cudaFreeAsync(d_original_data, stream); });
@@ -519,7 +517,7 @@ bool CompressFloats(
 
     // Create output buffer
     uint32_t* packed_blocks = nullptr;
-    cudaError_t err = cudaMallocManaged((void**)&packed_blocks, block_count*BLOCK_BYTES, cudaMemAttachGlobal);
+    cudaError_t err = cudaMallocManaged((void**)&packed_blocks, block_count * BLOCK_BYTES, cudaMemAttachGlobal);
     if (err != cudaSuccess) {
         cerr << "cudaMallocAsync failed: err=" << cudaGetErrorString(err) << " block_count=" << block_count << endl;
         return false;
