@@ -2,8 +2,6 @@
 
 #include <zstd.h>
 
-#include <cub/cub.cuh> // CUB from CUDA Toolkit
-
 #include <iostream>
 using namespace std;
 
@@ -16,41 +14,27 @@ static const int kZstdCompressionLevel = 1;
 static const uint32_t kMagic = 0x00010203;
 static const uint32_t kHeaderBytes = 4 + 4 + 4 + 4; // see below for format
 
-#define BLOCK_SIZE 512
+#define BLOCK_SIZE 256
 #define QUANT_GROUP_SIZE 32
 #define THREAD_GROUP_COUNT 4
+#define INTERLEAVE_BITS 2
+
 #define THREAD_FLOAT_COUNT (THREAD_GROUP_COUNT * QUANT_GROUP_SIZE)
 #define BLOCK_FLOAT_COUNT (BLOCK_SIZE * THREAD_FLOAT_COUNT)
-#define BLOCK_PARAM_COUNT (BLOCK_SIZE * THREAD_GROUP_COUNT)
-#define PARAM_SIZE (4 + 1 + 1)
-#define BLOCK_BYTES (BLOCK_PARAM_COUNT*PARAM_SIZE + BLOCK_FLOAT_COUNT*sizeof(float))
-#define INTERLEAVE_BITS 1
+#define BLOCK_BYTES (BLOCK_FLOAT_COUNT * 4)
 
 /*
-    Header:
+    Format:
         kMagic(4 bytes)
         DecompressedBytes(4 bytes)
         Epsilon(4 bytes)
         FloatCount(4 bytes)
-
-    All of the following data is compressed:
-
-        Block 0 used words(4 bytes)
-        Block 1 used words(4 bytes)
-        ...
-        Block N used words(4 bytes)
-
-    Followed by each block:
-        MaxIndex(1 byte) x BLOCK_PARAM_COUNT
-        Bits(1 byte) x BLOCK_PARAM_COUNT
-        HighBits(4 bytes) x BLOCK_PARAM_COUNT
-        <Compressed Floats>
-            Quantization Group 0(QUANT_GROUP_SIZE * Bits_0 / 8 bytes)
-            Quantization Group 1(QUANT_GROUP_SIZE * Bits_1 / 8 bytes)
-            ...
-            Quantization Group i(QUANT_GROUP_SIZE * Bits_i / 8 bytes)
+        Zstd-Compressed-Data(X bytes)
 
     Compression Algorithm:
+
+        The input is padded out to a multiple of BLOCK_FLOAT_COUNT.
+
         First quantize (int32_t) each float by dividing by epsilon:
             X[i] = Torch.Round( Float[i] / epsilon )
 
@@ -63,54 +47,44 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4 + 4; // see below for format
         each quantized value becomes an unsigned integer.
             X[i] = ZigZagEncode( X[i] )
 
-        Find the two largest values in each QUANT_GROUP_SIZE.
-            X_max = Max(X[i]), X_max2 = SecondLargest(X[i])
-
-        Get the number of bits required to represent X_max2.
-            Bits = BitCount(X_max2)
-
-        Store index of X_max and the high bits (X_max >> Bits) and the
-        number of Bits in a table, for use in decompression.
-
         Interleave Bits from sets of quantized values.
         So every 32 bits of output corresponds to one vertical column of bits
         from QUANT_GROUP_SIZE quantized values.
-        These values are packed together for each block of BLOCK_SIZE threads
-        using synchronization between threads in the block.
+
+        In a second pass, interleave the words of each block, so that
+        all low bit slices are interleaved together in each block.
 
     The above algorithm runs on GPU massively in parallel.
     This prepares the data for further compression on CPU using Zstd. 
-    The result of GPU compression is a set of disjoint blocks.
-    Each block is compressed using ZSTD_compressStream as if they were
-    contiguous in memory rather than disjoint blocks.
 
     The header includes all the information needed to decompress the data.
 
 
     Decompression Algorithm:
 
-    We decompress the data into a large contiguous buffer that is shared
-    with the GPU.  On GPU:
+        We decompress the data into a large contiguous buffer that is shared
+        with the GPU.
 
-        For each quantization group:
-            Unpack the quantized values from the bit packing.
+        For each thread block:
 
-            Restore the largest value from the table.
+            De-interleave words for each thread.
 
-            X[i] = ZigZagDecode( X[i] ), now a 32-bit signed integer.
+        For each thread:
 
-            X[i] = X[i] + X[i - 1]
+            De-interleave bits from THREAD_FLOAT_COUNT thread words.
 
-            X[i] = X[i] * epsilon
+            For each quantization group:
+                X[i] = ZigZagDecode( X[i] ), now a 32-bit signed integer.
 
-    The result will be the original set of floating point numbers that can be
-    read back to the CPU.
+                X[i] = X[i] + X[i - 1]
+
+                X[i] = X[i] * epsilon
+
+        The result will be the original set of floating point numbers that can be
+        read back to the CPU.
 
 
     Discussion:
-
-    I believe this algorithm is a good compromise between speed, compression
-    ratio, and simplicity.
 
     Floating-point values are quantized to a given epsilon.  This is done by
     dividing by epsilon and rounding to the nearest integer.
@@ -127,23 +101,11 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4 + 4; // see below for format
     There's an example of this more complex algorithm here:
     https://github.com/catid/Zdepth/blob/ac7c6d8e944d07be2404e5a1eaa04562595f3756/src/zdepth.cpp#L437 
 
-    Zig-Zag encoding is used, as described in https://lemire.me/blog/2022/11/25/making-all-your-integers-positive-with-zigzag-encoding/
-    This is a simple way to encode signed integers into unsigned integers,
-    so that the high bits are all zeros.
+    I tried the exception list approach of https://github.com/lemire/FastPFor
+    but found that after Zstd compression, the simpler approach was better.
 
-    The exception list of a single largest value per quantization group is
-    inspired by https://github.com/lemire/FastPFor
-    specifically this part: https://github.com/lemire/FastPFor/blob/8ba17c93ed2c173caba839427858a16236833f77/headers/pfor.h#L306
-    To make it GPU friendly and simpler, this algorithm always has just one
-    exception per quantization group.  To motivate this, consider the case
-    where the values are similar to eachother but large.  In this case, the
-    first value will be much larger than the rest after subtracting neighbors.
-    If we make that first value an exception, then the rest of the values can
-    be packed together much more tightly.
-
-    Further improvements might be achieved by interleaving multiple blocks
-    in a second pass through the data prior to Zstd compression, though I
-    suspect this would have diminishing returns.
+    I tried the 1-bit interleaving approach of cuSZp, but found that after
+    Zstd compression, 2-bit interleaving was better and faster.
 */
 
 
@@ -187,17 +149,12 @@ inline float read_float_le(const void* buffer) {
 //------------------------------------------------------------------------------
 // Tools
 
-// Round up to the next power of 2
-#define ROUND_UP_POW2(x, pow2) \
-    (((x) + ((pow2) - 1)) & ~((pow2) - 1))
-
 struct CallbackScope {
     CallbackScope(std::function<void()> func) : func(func) {}
     ~CallbackScope() { func(); }
     std::function<void()> func;
 };
 
-#define BIT_COUNT(x) ( 32 - __clz(x) )
 #define ZIGZAG_ENCODE(x) (((x) << 1) ^ (x >> 31))
 #define ZIGZAG_DECODE(x) ((x) >> 1) ^ -((int32_t)(x) & 1)
 
@@ -207,11 +164,10 @@ struct CallbackScope {
 
 __device__ inline void interleave_words_1bit(
     const uint32_t* const __restrict__ input,
-    uint32_t* const __restrict__ output,
-    uint32_t bits)
+    uint32_t* const __restrict__ output)
 {
     #pragma unroll
-    for (uint32_t shift = 0; shift < bits; shift++) {
+    for (uint32_t shift = 0; shift < 32; shift++) {
         uint32_t mask = 1U << shift;
         uint32_t result = (input[0] & mask) >> shift;
 
@@ -226,11 +182,12 @@ __device__ inline void interleave_words_1bit(
 
 __device__ inline void interleave_words_2bit(
     const uint32_t* const __restrict__ input,
-    uint32_t* const __restrict__ output,
-    uint32_t bits)
+    uint32_t* const __restrict__ output)
 {
+    static_assert(QUANT_GROUP_SIZE == 32, "QUANT_GROUP_SIZE must be 32");
+
     #pragma unroll
-    for (uint32_t shift = 0; shift < bits; shift += 2) {
+    for (uint32_t shift = 0; shift < 32; shift += 2) {
         uint32_t result_0 = 0;
         uint32_t result_1 = 0;
         uint32_t mask = 0x3 << shift;
@@ -250,11 +207,10 @@ __device__ inline void interleave_words_2bit(
 
 __device__ inline void interleave_words_4bit(
     const uint32_t* const __restrict__ input,
-    uint32_t* const __restrict__ output,
-    uint32_t bits)
+    uint32_t* const __restrict__ output)
 {
     #pragma unroll
-    for (uint32_t shift = 0; shift < bits; shift += 4) {
+    for (uint32_t shift = 0; shift < 32; shift += 4) {
         uint32_t result_0 = 0;
         uint32_t result_1 = 0;
         uint32_t result_2 = 0;
@@ -283,11 +239,10 @@ __device__ inline void interleave_words_4bit(
 
 __device__ inline void interleave_words_8bit(
     const uint32_t* const __restrict__ input,
-    uint32_t* const __restrict__ output,
-    uint32_t bits)
+    uint32_t* const __restrict__ output)
 {
     #pragma unroll
-    for (uint32_t shift = 0; shift < bits; shift += 8) {
+    for (uint32_t shift = 0; shift < 32; shift += 8) {
         uint32_t mask = 0xFF << shift;
 
         uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
@@ -322,14 +277,13 @@ __device__ inline void interleave_words_8bit(
 
 __device__ inline void deinterleave_words_1bit(
     const uint32_t* const __restrict__ input,
-    uint32_t* const __restrict__ output,
-    uint32_t bits)
+    uint32_t* const __restrict__ output)
 {
     #pragma unroll
     for (uint32_t i = 0; i < 32; i++) {
         uint32_t result = 0;
         #pragma unroll
-        for (uint32_t j = 0; j < bits; j++) {
+        for (uint32_t j = 0; j < 32; j++) {
             result |= ((input[j] >> i) & 1) << j;
         }
         output[i] = result;
@@ -338,14 +292,13 @@ __device__ inline void deinterleave_words_1bit(
 
 __device__ inline void deinterleave_words_2bit(
     const uint32_t* const __restrict__ input,
-    uint32_t* const __restrict__ output,
-    uint32_t bits)
+    uint32_t* const __restrict__ output)
 {
     #pragma unroll
     for (uint32_t i = 0; i < 16; i++) {
         uint32_t result_0 = 0, result_1 = 0;
         #pragma unroll
-        for (uint32_t j = 0; j < bits; j += 2) {
+        for (uint32_t j = 0; j < 32; j += 2) {
             result_0 |= ((input[j] >> (i*2)) & 3) << j;
             result_1 |= ((input[j+1] >> (i*2)) & 3) << j;
         }
@@ -356,14 +309,13 @@ __device__ inline void deinterleave_words_2bit(
 
 __device__ inline void deinterleave_words_4bit(
     const uint32_t* const __restrict__ input,
-    uint32_t* const __restrict__ output,
-    uint32_t bits)
+    uint32_t* const __restrict__ output)
 {
     #pragma unroll
     for (uint32_t i = 0; i < 8; i++) {
         uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
         #pragma unroll
-        for (uint32_t j = 0; j < bits; j += 4) {
+        for (uint32_t j = 0; j < 32; j += 4) {
             result_0 |= ((input[j] >> (i*4)) & 0xF) << j;
             result_1 |= ((input[j+1] >> (i*4)) & 0xF) << j;
             result_2 |= ((input[j+2] >> (i*4)) & 0xF) << j;
@@ -378,15 +330,14 @@ __device__ inline void deinterleave_words_4bit(
 
 __device__ inline void deinterleave_words_8bit(
     const uint32_t* const __restrict__ input,
-    uint32_t* const __restrict__ output,
-    uint32_t bits)
+    uint32_t* const __restrict__ output)
 {
     #pragma unroll
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t result_0 = 0, result_1 = 0, result_2 = 0, result_3 = 0;
         uint32_t result_4 = 0, result_5 = 0, result_6 = 0, result_7 = 0;
         #pragma unroll
-        for (uint32_t j = 0; j < bits; j += 8) {
+        for (uint32_t j = 0; j < 32; j += 8) {
             result_0 |= ((input[j] >> (i*8)) & 0xFF) << j;
             result_1 |= ((input[j+1] >> (i*8)) & 0xFF) << j;
             result_2 |= ((input[j+2] >> (i*8)) & 0xFF) << j;
@@ -412,105 +363,56 @@ __device__ inline void deinterleave_words_8bit(
 // Compression Kernel
 
 __global__ void SZplus_compress(
-    const float* const __restrict__ original_data,
+    const float* __restrict__ original_data,
     float epsilon,
     uint32_t* __restrict__ block_used_words,
-    uint8_t* __restrict__ compressed_data)
+    uint32_t* __restrict__ compressed_data)
 {
-    using BlockScan = cub::BlockScan<uint32_t, BLOCK_SIZE>;
-    __shared__ typename BlockScan::TempStorage temp_storage;
+    // All interleaved words for this thread block
+    __shared__ uint32_t shared_words[BLOCK_FLOAT_COUNT];
+
+    // Local registers for interleaved bits for this thread
+    uint32_t thread_words[THREAD_FLOAT_COUNT];
 
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    original_data += thread_idx * THREAD_FLOAT_COUNT;
 
-    compressed_data += blockIdx.x * BLOCK_BYTES;
-
-    uint32_t quant_group[THREAD_FLOAT_COUNT];
-    uint8_t group_bits[THREAD_GROUP_COUNT];
-
+    // Quantize, delta, zig-zag encode
     epsilon = 1.0f / epsilon;
-    uint32_t used_words = 0;
-    int32_t prev_quant = 0;
-    for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
-        uint32_t max_quant = 0, max2_quant = 0;
-        uint8_t max_index = 0;
-
-        for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
-            int float_index = thread_idx * THREAD_FLOAT_COUNT + j;
-            float f = original_data[float_index] * epsilon;
-
-            // This is the same quantization used by torch.round()
-            const int32_t quant = __float2int_rn(f);
-
-            const int32_t delta = quant - prev_quant;
-            prev_quant = quant;
-
-            const uint32_t zig_quant = ZIGZAG_ENCODE(delta);
-            quant_group[i * QUANT_GROUP_SIZE + j] = zig_quant;
-
-            // Update max_quant (largest) and max2_quant (second largest)
-            if (zig_quant > max_quant) {
-                max2_quant = max_quant;
-                max_quant = zig_quant;
-                max_index = (uint8_t)j;
-            } else if (zig_quant > max2_quant) {
-                max2_quant = zig_quant;
-            }
-        }
-
-        // Number of bits to represent second largest and smaller quantized values
-        const uint32_t bits = ROUND_UP_POW2(BIT_COUNT(max2_quant), INTERLEAVE_BITS);
-
-        // Increment write count for this quantization group
-        used_words += bits;
-
-        group_bits[i] = static_cast<uint8_t>(bits);
-
-        const uint32_t max_high_bits = (bits >= 32) ? 0 : (max_quant >> bits);
-
-        // For each QUANT_GROUP_SIZE, write the number of bits, index of max value, and high bits
-        uint8_t* __restrict__ params = compressed_data + BLOCK_PARAM_COUNT * threadIdx.x + i;
-        params[0] = static_cast<uint8_t>(bits);
-        params[BLOCK_PARAM_COUNT] = static_cast<uint8_t>(max_index);
-        params[BLOCK_PARAM_COUNT*2] = static_cast<uint8_t>(max_high_bits);
-        params[BLOCK_PARAM_COUNT*3] = static_cast<uint8_t>(max_high_bits >> 8);
-        params[BLOCK_PARAM_COUNT*4] = static_cast<uint8_t>(max_high_bits >> 16);
-        params[BLOCK_PARAM_COUNT*5] = static_cast<uint8_t>(max_high_bits >> 24);
+    int32_t prev = 0;
+    for (int i = 0; i < THREAD_FLOAT_COUNT; i++) {
+        const int32_t quant = __float2int_rn(original_data[i] * epsilon);
+        const int32_t delta = quant - prev;
+        prev = quant;
+        thread_words[i] = ZIGZAG_ENCODE(delta);
     }
 
-    __syncthreads(); // Barrier for smem reuse
-
-    BlockScan block_scan(temp_storage);
-    uint32_t offset = 0;
-    block_scan.ExclusiveSum(used_words, offset);
-
-    __syncthreads(); // Barrier for smem reuse
-
-    if (threadIdx.x == blockDim.x - 1) {
-        block_used_words[blockIdx.x] = offset + used_words;
-    }
-
-    // Get pointer to compressed words for this thread
-    compressed_data += BLOCK_PARAM_COUNT * PARAM_SIZE;
-    uint32_t* __restrict__ compressed_words = reinterpret_cast<uint32_t*>(compressed_data);
-    compressed_words += offset;
-
+    #pragma unroll
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
-        // Note: This code also works for bits=0
-        const uint32_t bits = group_bits[i];
+        //block_words[threadIdx.x * THREAD_FLOAT_COUNT + i] = zig_delta;
 
 #if INTERLEAVE_BITS == 1
-        interleave_words_1bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+        interleave_words_1bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
 #elif INTERLEAVE_BITS == 2
-        interleave_words_2bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+        interleave_words_2bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
 #elif INTERLEAVE_BITS == 4
-        interleave_words_4bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+        interleave_words_4bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
 #elif INTERLEAVE_BITS == 8
-        interleave_words_8bit(quant_group + i * QUANT_GROUP_SIZE, compressed_words, bits);
+        interleave_words_8bit(thread_words + i * QUANT_GROUP_SIZE, shared_words + threadIdx.x * THREAD_FLOAT_COUNT + i * QUANT_GROUP_SIZE);
 #else
 #error "Invalid INTERLEAVE_BITS value. Must be 1, 2, 4, or 8."
 #endif
+    }
 
-        compressed_words += bits;
+    compressed_data += blockIdx.x * BLOCK_FLOAT_COUNT;
+
+    __syncthreads(); // Barrier for smem
+
+    int offset = threadIdx.x * QUANT_GROUP_SIZE * THREAD_FLOAT_COUNT % BLOCK_FLOAT_COUNT;
+
+    #pragma unroll
+    for (int i = 0; i < THREAD_FLOAT_COUNT; i++) {
+        compressed_data[i] = shared_words[offset + i * QUANT_GROUP_SIZE];
     }
 }
 
@@ -646,7 +548,7 @@ bool CompressFloats(
 
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
-    SZplus_compress<<<gridSize, blockSize, 0, stream>>>(
+    SZplus_compress<<<gridSize, blockSize, BLOCK_BYTES, stream>>>(
         float_data,
         epsilon,
         block_used_words,
@@ -842,7 +744,7 @@ bool DecompressFloats(
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
     cerr << "INFO: Launching decompression kernel with grid size " << gridSize.x << " and block size " << blockSize.x << endl;
-    SZplus_decompress<<<gridSize, blockSize, 0, stream>>>(
+    SZplus_decompress<<<gridSize, blockSize, BLOCK_BYTES, stream>>>(
         decompressed_floats,
         managed_decompressed_blocks,
         block_used_words,

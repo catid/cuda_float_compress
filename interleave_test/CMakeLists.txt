@@ -44,3 +44,5 @@ target_include_directories(interleave_test PRIVATE ${CUDA_INCLUDE_DIRS})
 
 # Link libraries
 target_link_libraries(interleave_test ${CUDA_LIBRARIES})
+
+add_executable(test_offset test_offset.cpp)
