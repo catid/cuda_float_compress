@@ -38,7 +38,7 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
             X[i] = Torch.Round( Float[i] / epsilon )
 
         Within each GPU thread, subtract consecutive floats
-        for sets of THREAD_GROUP_COUNT * QUANT_GROUP_SIZE floats:
+        for sets of THREAD_FLOAT_COUNT floats:
             X[i] = X[i] - X[i - 1]
 
         Zig-zag encoding: (x << 1) ^ (x >> 31)
@@ -46,15 +46,16 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
         each quantized value becomes an unsigned integer.
             X[i] = ZigZagEncode( X[i] )
 
-        Interleave Bits from sets of quantized values.
-        So every 32 bits of output corresponds to one vertical column of bits
-        from QUANT_GROUP_SIZE quantized values.
+        Interleave bits from groups of QUANT_GROUP_SIZE floats.
+        So, every 32 bit word of output corresponds to one vertical column
+        of bits from QUANT_GROUP_SIZE quantized floats.
 
         In a second pass, interleave the words of each block, so that
-        all low bit slices are interleaved together in each block.
+        e.g. all low bit slices are interleaved together in each block.
 
     The above algorithm runs on GPU massively in parallel.
-    This prepares the data for further compression on CPU using Zstd. 
+    This prepares the data for further compression on CPU using Zstd's
+    fastest compression mode.
 
     The header includes all the information needed to decompress the data.
 
@@ -64,17 +65,19 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
         We Zstd-decompress the data into a large contiguous buffer that is
         shared with the GPU.
 
-        For each thread:
+        For each GPU thread:
 
-            De-interleave words for each thread.
-            De-interleave bits from THREAD_FLOAT_COUNT thread words.
+            De-interleave words for each thread from global memory.
+            De-interleave bits from THREAD_FLOAT_COUNT words.
 
-            For each quantization group:
+            For THREAD_GROUP_COUNT sets of QUANT_GROUP_SIZE floats:
                 X[i] = ZigZagDecode( X[i] ), now a 32-bit signed integer.
 
-                X[i] = X[i] + X[i - 1]
+                Undo delta coding:
+                    X[i] = X[i] + X[i - 1]
 
-                X[i] = X[i] * epsilon
+                Undo quantization:
+                    X[i] = X[i] * epsilon
 
         The result will be the original set of floating point numbers that can be
         read back to the CPU.
