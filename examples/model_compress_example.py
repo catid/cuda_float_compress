@@ -3,6 +3,7 @@ import torchvision.models as models
 import cuda_float_compress
 import zstandard as zstd
 import numpy as np
+import copy
 
 # Function to compress a tensor using Zstd
 def compress_tensor_zstd(tensor, compression_level=1):
@@ -32,38 +33,58 @@ def decompress_tensor_zstd(compressed_data, expected_bytes):
 
     return tensor
 
+def flatten_params(model):
+    return torch.cat([p.data.view(-1) for p in model.parameters() if p.dtype == torch.float32])
+
+def unflatten_params(model, flat_params):
+    offset = 0
+    for p in model.parameters():
+        if p.dtype == torch.float32:
+            numel = p.numel()
+            p.data.copy_(flat_params[offset:offset + numel].view_as(p.data))
+            offset += numel
+
 def main():
+    gpu_device = torch.device("cuda:0")
+
     # Load a pretrained model (e.g., ResNet18)
     model = models.resnet18(pretrained=True)
+    model.to(gpu_device)
 
-    # Verify decompression
-    original_params = torch.cat([p.data.view(-1) for p in model.parameters()])
-    print(f"oring_params.shape: {original_params.shape}")
-    for p in model.parameters():
-        data = p.data.view(-1)
+    # Create a copy of the model
+    original_model = copy.deepcopy(model.state_dict())
 
-        (d_min, d_max) = torch.aminmax(data.detach())
-        range = (d_max - d_min).float()
-        rescaled = (data - d_min).float() / range
+    # Flatten all parameters
+    original_params = flatten_params(model)
+    print(f"original_params.shape: {original_params.shape}")
 
-        raw_data = rescaled
+    # Set error bound for compression (adjust as needed)
+    error_bound = 0.00001
 
-        print(f"raw_data = {raw_data} {raw_data.shape} {raw_data.dtype} {raw_data.device}")
+    # Compress the rescaled parameters
+    compressed_params = cuda_float_compress.cuszplus_compress(original_params, error_bound)
 
-        # Set error bound for compression (adjust as needed)
-        error_bound = 0.00001
+    print(f"compressed_params = {compressed_params.shape} {compressed_params.dtype} {compressed_params.device}")
 
-        compressed_params = cuda_float_compress.cuszplus_compress(raw_data, error_bound)
+    # Decompress the parameters
+    decompressed_params = cuda_float_compress.cuszplus_decompress(compressed_params, gpu_device)
 
-        print(f"compressed_params = {compressed_params} {compressed_params.shape} {compressed_params.dtype} {compressed_params.device}")
+    ratio = original_params.numel() * 4.0 / compressed_params.numel()
+    print(f"Overall Compression Ratio: {ratio:.2f}")
 
-        decompressed_params = cuda_float_compress.cuszplus_decompress(compressed_params)
+    unflatten_params(model, decompressed_params)
 
-        print(f"decompressed_params = {decompressed_params} {decompressed_params.shape} {decompressed_params.dtype} {decompressed_params.device}")
+    for name, data in model.state_dict().items():
+        if data.dtype != torch.float32:
+            continue
+        print(f"{name} = {data.shape} {data.dtype} {data.device}")
 
-        mse = torch.mean((raw_data - decompressed_params) ** 2)
-        ratio = raw_data.numel() * 4.0 / compressed_params.numel()
-        print(f"Mean Squared Error after compression/decompression: {mse.item()} Ratio: {ratio:.2f}")
+        modified = data.view(-1)
+        original = original_model[name].view(-1)
+
+        max_err = torch.max(torch.abs(original - modified))
+        mse = torch.mean((original - modified) ** 2)
+        print(f"    MSE: {mse.item()} Max Error: {max_err.item()}")
 
 if __name__ == "__main__":
     main()

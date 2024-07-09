@@ -439,19 +439,19 @@ __global__ void SZplus_decompress(
     float_count -= thread_idx * THREAD_FLOAT_COUNT;
     compressed_words += threadIdx.x * THREAD_GROUP_COUNT;
 
+    uint32_t shuffled_words[QUANT_GROUP_SIZE];
+    uint32_t quant_words[QUANT_GROUP_SIZE];
+
     int32_t value = 0;
 
     #pragma unroll
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
-        uint32_t shuffled_words[QUANT_GROUP_SIZE];
-
         #pragma unroll
         for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
             shuffled_words[j] = compressed_words[j * INTERLEAVE_STRIDE];
         }
         compressed_words++;
 
-        uint32_t quant_words[QUANT_GROUP_SIZE];
 #if INTERLEAVE_BITS == 1
         deinterleave_words_1bit(shuffled_words, quant_words);
 #elif INTERLEAVE_BITS == 2
@@ -607,12 +607,7 @@ bool DecompressFloats(
         return false;
     }
 
-    cerr << "INFO: Decompressing " << float_count << " floats with epsilon " << epsilon << endl;
-
-    // Calculate block count
     const int block_count = (float_count + BLOCK_FLOAT_COUNT - 1) / BLOCK_FLOAT_COUNT;
-
-    cerr << "INFO: Block count: " << block_count << ", Block bytes: " << BLOCK_BYTES << endl;
 
     // Allocate CUDA managed memory for decompressed blocks
     uint32_t* interleaved_words = nullptr;
@@ -640,7 +635,6 @@ bool DecompressFloats(
     // Launch decompression kernel
     dim3 blockSize(BLOCK_SIZE);
     dim3 gridSize(block_count);
-    cerr << "INFO: Launching decompression kernel with grid size " << gridSize.x << " and block size " << blockSize.x << endl;
     SZplus_decompress<<<gridSize, blockSize, 0, stream>>>(
         decompressed_floats,
         float_count,

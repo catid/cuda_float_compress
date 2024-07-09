@@ -40,7 +40,7 @@ torch::Tensor cuszplus_compress(torch::Tensor input, float epsilon) {
     return compresed_buffer.slice(0, 0, compressed_buffer_size);
 }
 
-torch::Tensor cuszplus_decompress(torch::Tensor compressed) {
+torch::Tensor cuszplus_decompress(torch::Tensor compressed, torch::Device device) {
     if (!compressed.is_contiguous()) {
         compressed = compressed.contiguous();
     }
@@ -49,6 +49,9 @@ torch::Tensor cuszplus_decompress(torch::Tensor compressed) {
     }
     if (compressed.is_cuda()) {
         throw std::runtime_error("Input tensor must be on the CPU");
+    }
+    if (!device.is_cuda()) {
+        throw std::runtime_error("Output device must be CUDA");
     }
 
     const int compressed_bytes = static_cast<int>(compressed.numel());
@@ -62,7 +65,7 @@ torch::Tensor cuszplus_decompress(torch::Tensor compressed) {
         float_count = 0;
     }
 
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(compressed.device());
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
     torch::Tensor result = torch::empty(float_count, options);
 
     if (float_count <= 0) {
