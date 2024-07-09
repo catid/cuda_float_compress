@@ -48,14 +48,18 @@ def main():
 
         raw_data = rescaled
 
-        print(f"raw_data = {raw_data}")
+        print(f"raw_data = {raw_data} {raw_data.shape} {raw_data.dtype} {raw_data.device}")
 
         # Set error bound for compression (adjust as needed)
         error_bound = 0.00001
 
         compressed_params = cuda_float_compress.cuszplus_compress(raw_data, error_bound)
 
+        print(f"compressed_params = {compressed_params} {compressed_params.shape} {compressed_params.dtype} {compressed_params.device}")
+
         decompressed_params = cuda_float_compress.cuszplus_decompress(compressed_params)
+
+        print(f"decompressed_params = {decompressed_params} {decompressed_params.shape} {decompressed_params.dtype} {decompressed_params.device}")
 
         mse = torch.mean((raw_data - decompressed_params) ** 2)
         ratio = raw_data.numel() * 4.0 / compressed_params.numel()

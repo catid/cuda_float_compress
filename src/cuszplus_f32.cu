@@ -430,11 +430,13 @@ __global__ void SZplus_compress(
 
 __global__ void SZplus_decompress(
     float* __restrict__ decompressed_floats,
+    int float_count,
     const uint32_t* __restrict__ compressed_words,
     float epsilon)
 {
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     decompressed_floats += thread_idx * THREAD_FLOAT_COUNT;
+    float_count -= thread_idx * THREAD_FLOAT_COUNT;
     compressed_words += threadIdx.x * THREAD_GROUP_COUNT;
 
     int32_t value = 0;
@@ -462,10 +464,14 @@ __global__ void SZplus_decompress(
 
         for (int j = 0; j < QUANT_GROUP_SIZE; j++) {
             value += ZIGZAG_DECODE(quant_words[j]);
-            decompressed_floats[j] = value * epsilon;
+            const float f = value * epsilon;
+            if (j < float_count) {
+                decompressed_floats[j] = f;
+            }
         }
 
         decompressed_floats += QUANT_GROUP_SIZE;
+        float_count -= QUANT_GROUP_SIZE;
     } // next quantization group
 }
 
@@ -565,21 +571,22 @@ int GetDecompressedFloatCount(
         return -1;  // Return -1 to indicate an error
     }
 
-    const uint8_t* data = static_cast<const uint8_t*>(compressed_data);
+    const uint8_t* header_data = static_cast<const uint8_t*>(compressed_data);
+    const uint32_t magic = read_uint32_le(header_data);
+    const int float_count = read_uint32_le(header_data + 4);
 
     // Check magic number
-    const uint32_t magic = read_uint32_le(data);
     if (magic != kMagic) {
-        cerr << "ERROR: Invalid magic number. Expected 0x" << hex << kMagic << ", but got 0x" << magic << dec << endl;
+        cerr << "ERROR: Invalid magic number (header parse). Expected 0x" << hex << kMagic << ", but got 0x" << magic << dec << endl;
         return -1;  // Return -1 to indicate an error
     }
 
-    return read_uint32_le(data + 4);
+    return float_count;
 }
 
 bool DecompressFloats(
     cudaStream_t stream,
-    const void* compressed_data,
+    const void* compressed_data_,
     int compressed_bytes,
     float* decompressed_floats)
 {
@@ -588,11 +595,12 @@ bool DecompressFloats(
         return false;
     }
 
+    const uint8_t* compressed_data = static_cast<const uint8_t*>(compressed_data_);
+
     // Read header
-    const uint8_t* header_data = static_cast<const uint8_t*>(compressed_data);
-    const uint32_t magic = read_uint32_le(header_data);
-    const int float_count = read_uint32_le(header_data + 4);
-    const float epsilon = read_float_le(header_data + 8);
+    const uint32_t magic = read_uint32_le(compressed_data);
+    const int float_count = read_uint32_le(compressed_data + 4);
+    const float epsilon = read_float_le(compressed_data + 8);
 
     if (magic != kMagic) {
         cerr << "ERROR: Invalid magic number. Expected 0x" << hex << kMagic << ", but got 0x" << magic << dec << endl;
@@ -607,20 +615,25 @@ bool DecompressFloats(
     cerr << "INFO: Block count: " << block_count << ", Block bytes: " << BLOCK_BYTES << endl;
 
     // Allocate CUDA managed memory for decompressed blocks
-    uint32_t* compressed_words = nullptr;
-    cudaError_t err = cudaMallocManaged((void**)&compressed_words, block_count * BLOCK_BYTES, cudaMemAttachGlobal);
+    uint32_t* interleaved_words = nullptr;
+    cudaError_t err = cudaMallocManaged((void**)&interleaved_words, block_count * BLOCK_BYTES, cudaMemAttachGlobal);
     if (err != cudaSuccess) {
         cerr << "ERROR: Failed to allocate CUDA managed memory for decompressed blocks: " << cudaGetErrorString(err) << endl;
         return false;
     }
-    CallbackScope words_cleanup([&]() { cudaFree(compressed_words); });
+    CallbackScope words_cleanup([&]() { cudaFree(interleaved_words); });
 
     size_t const decompressed_size = ZSTD_decompress(
-        compressed_words, block_count * BLOCK_BYTES,
-        compressed_data, compressed_bytes);
+        interleaved_words, block_count * BLOCK_BYTES,
+        compressed_data + kHeaderBytes, compressed_bytes - kHeaderBytes);
+    if (ZSTD_isError(decompressed_size)) {
+        std::cerr << "ZSTD_decompress error: " << ZSTD_getErrorName(decompressed_size) << std::endl;
+        return false;
+    }
 
-    if (ZSTD_isError(decompressed_size) || decompressed_size != block_count * BLOCK_BYTES) {
-        cerr << "ERROR: ZSTD decompression failed: decompressed_size=" << decompressed_size << endl;
+    if (decompressed_size != block_count * BLOCK_BYTES) {
+        std::cerr << "ERROR: ZSTD decompressed output does not match expected size: decompressed_size="
+            << decompressed_size << " expected_size=" << block_count * BLOCK_BYTES << std::endl;
         return false;
     }
 
@@ -630,7 +643,8 @@ bool DecompressFloats(
     cerr << "INFO: Launching decompression kernel with grid size " << gridSize.x << " and block size " << blockSize.x << endl;
     SZplus_decompress<<<gridSize, blockSize, 0, stream>>>(
         decompressed_floats,
-        compressed_words,
+        float_count,
+        interleaved_words,
         epsilon);
 
     // Check for kernel launch errors
