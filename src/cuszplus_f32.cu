@@ -61,15 +61,12 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
 
     Decompression Algorithm:
 
-        We decompress the data into a large contiguous buffer that is shared
-        with the GPU.
-
-        For each thread block:
-
-            De-interleave words for each thread.
+        We Zstd-decompress the data into a large contiguous buffer that is
+        shared with the GPU.
 
         For each thread:
 
+            De-interleave words for each thread.
             De-interleave bits from THREAD_FLOAT_COUNT thread words.
 
             For each quantization group:
@@ -104,7 +101,7 @@ static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
     but found that after Zstd compression, the simpler approach was better.
 
     I tried the 1-bit interleaving approach of cuSZp, but found that after
-    Zstd compression, 2-bit interleaving was better and faster.
+    Zstd compression, 2-bit interleaving was faster and sometimes better.
 */
 
 
