@@ -11,6 +11,35 @@ Please read the `src/cuszplus_f32.cu` file for details on the compression algori
 Released under BSD 3-Clause License for unrestricted use in commercial and open-source software.
 
 
+## Prerequisites
+
+This requires [CUDA Toolit](https://developer.nvidia.com/cuda-downloads) and CMake.  On Ubuntu you can install them with:
+
+```bash
+sudo apt install cuda cuda-toolkit cmake build-essential
+```
+
+Make sure that `nvidia-smi` shows your GPU as being usable.  You may need to reboot.
+
+Also make sure that you can run `nvcc --version` and get something like this:
+
+```bash
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Thu_Mar_28_02:18:24_PDT_2024
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0
+```
+
+If you see an `nvcc not found` error, you should be able to fix it by typing this command:
+
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+```
+
+Adding this line to the end of your `.bashrc` or `.zshrc` file will make it permanent.
+
+
 ## Basic Example
 
 Add the `cuda_float_compress` package to your Python environment.
@@ -20,7 +49,7 @@ Add the `cuda_float_compress` package to your Python environment.
 pip install -U cuda_float_compress
 ```
 
-Then you can use it like this in your Python code:
+Then you can use this minimal example to verify that it works (available in `examples/minimal_example.py`):
 
 ```python
 import torch
@@ -43,6 +72,10 @@ compressed_data = cuda_float_compress.cuszplus_compress(original_data, error_bou
 
 # Decompress the data
 decompressed_data = cuda_float_compress.cuszplus_decompress(compressed_data, gpu_device)
+
+# Verify that the decompressed data is the same as the original data
+assert torch.allclose(original_data, decompressed_data, atol=error_bound)
+print(f"Works! Compression Ratio: {original_data.numel() * 4.0 / compressed_data.numel():.2f}")
 ```
 
 
