@@ -156,7 +156,7 @@ On this 145M parameter model, it achieves a 4:1 compression ratio, matching the 
 
 It seems to take about 0.5 seconds per 150M parameters to compress, and a little faster to decompress.  So about 1.5GBPS.
 
-You can also see that `pyzfp` runs about the same speed as this Python package, but the compression ratio is much lower for machine learning models.
+You can also see that `pyzfp` runs about the same speed as this Python package, but the compression ratio is much lower for machine learning models.  So for what I'm working on right now, `cuda_float_compress` is a better choice.
 
 
 # Discussion
