@@ -12,12 +12,16 @@ using namespace std;
 static const uint32_t kMagic = 0x00010203;
 static const uint32_t kHeaderBytes = 4 + 4 + 4; // see below for format
 
-#define BLOCK_SIZE 256
-#define QUANT_GROUP_SIZE 32
-#define THREAD_GROUP_COUNT 4
-#define INTERLEAVE_BITS 2
-#define ZSTD_COMPRESSION_LEVEL 1
+// Hyper-parameters
+#define INTERLEAVE_BITS 2 /* Supports: 1, 2, 4, 8 */
+#define ZSTD_COMPRESSION_LEVEL 1 /* Zstd */
+#define QUANT_GROUP_SIZE 32 /* Only 32 supported */
 
+// Parallelism
+#define BLOCK_SIZE 256 /* Threads per block */
+#define THREAD_GROUP_COUNT 4 /* Number of quantization groups per thread */
+
+// Derived constants
 #define THREAD_FLOAT_COUNT (THREAD_GROUP_COUNT * QUANT_GROUP_SIZE)
 #define BLOCK_FLOAT_COUNT (BLOCK_SIZE * THREAD_FLOAT_COUNT)
 #define INTERLEAVE_STRIDE (BLOCK_SIZE * THREAD_GROUP_COUNT)
@@ -437,6 +441,7 @@ __global__ void SZplus_decompress(
     const int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     decompressed_floats += thread_idx * THREAD_FLOAT_COUNT;
     float_count -= thread_idx * THREAD_FLOAT_COUNT;
+    compressed_words += BLOCK_FLOAT_COUNT * blockIdx.x;
     compressed_words += threadIdx.x * THREAD_GROUP_COUNT;
 
     uint32_t shuffled_words[QUANT_GROUP_SIZE];

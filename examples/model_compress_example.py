@@ -27,9 +27,9 @@ def main():
     original_model = copy.deepcopy(model.state_dict())
 
     t0 = time.time()
-    error_bound = 0.00001
+    target_max_error = 0.0001
     original_params = flatten_params(model)
-    compressed_params = cuda_float_compress.cuszplus_compress(original_params, error_bound)
+    compressed_params = cuda_float_compress.cuszplus_compress(original_params, target_max_error)
     t1 = time.time()
 
     print(f"original_params.shape: {original_params.shape}")
@@ -51,7 +51,6 @@ def main():
         max_err = torch.max(torch.abs(original - modified))
         mse = torch.mean((original - modified) ** 2)
         print(f"    MSE: {mse.item()} Max Error: {max_err.item()}")
-        print(f"    Delta: {(modified)}")
 
     ratio = original_params.numel() * 4.0 / compressed_params.numel()
     print(f"Overall Compression Ratio: {ratio:.2f}")

@@ -8,7 +8,7 @@
 #include <vector>
 #include <stdexcept>
 
-torch::Tensor cuszplus_compress(torch::Tensor input, float epsilon) {
+torch::Tensor cuszplus_compress(torch::Tensor input, float max_error) {
     if (!input.is_contiguous()) {
         input = input.contiguous();
     }
@@ -31,7 +31,7 @@ torch::Tensor cuszplus_compress(torch::Tensor input, float epsilon) {
         float_count,
         compresed_buffer.data_ptr<uint8_t>(),
         compressed_buffer_size,
-        epsilon);
+        2.f * max_error);
 
     if (!success) {
         throw std::runtime_error("compressor.Compress failed: float_count=" + std::to_string(float_count));
