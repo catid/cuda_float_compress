@@ -105,8 +105,8 @@ conda activate cfc
 
 python examples/basic_example.py
 
-# Install torchvision to test the model_compress_example.py script
-pip install torchvision
+# Install torchvision and pyzfp to test the model_compress_example.py script
+pip install torchvision pyzfp
 python examples/model_compress_example.py
 ```
 
@@ -143,6 +143,9 @@ fc.bias = torch.Size([1000]) torch.float32 cuda:0
 Overall Compression Ratio: 4.02
 Time to compress params: 0.40 s
 Time to decompress params: 0.32 s
+
+pyzfp Compression Ratio: 2.54
+pyzfp Compression Time: 0.40 s
 ```
 
 Terminology:
@@ -152,6 +155,8 @@ Terminology:
 On this 145M parameter model, it achieves a 4:1 compression ratio, matching the performance of 8-bit quantization with guaranteed accuracy of 0.0001 per parameter.
 
 It seems to take about 0.5 seconds per 150M parameters to compress, and a little faster to decompress.  So about 1.5GBPS.
+
+You can also see that `pyzfp` runs about the same speed as this Python package, but the compression ratio is much lower for machine learning models.
 
 
 # Discussion

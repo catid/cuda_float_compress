@@ -4,6 +4,7 @@ import cuda_float_compress
 import numpy as np
 import copy
 import time
+import pyzfp
 
 def flatten_params(model):
     return torch.cat([p.data.view(-1) for p in model.parameters() if p.dtype == torch.float32])
@@ -26,9 +27,10 @@ def main():
     # Create a copy of the model
     original_model = copy.deepcopy(model.state_dict())
 
+    original_params = flatten_params(model)
+
     t0 = time.time()
     target_max_error = 0.0001
-    original_params = flatten_params(model)
     compressed_params = cuda_float_compress.cuszplus_compress(original_params, target_max_error)
     t1 = time.time()
 
@@ -37,8 +39,9 @@ def main():
 
     t2 = time.time()
     decompressed_params = cuda_float_compress.cuszplus_decompress(compressed_params, gpu_device)
-    unflatten_params(model, decompressed_params)
     t3 = time.time()
+
+    unflatten_params(model, decompressed_params)
 
     for name, data in model.state_dict().items():
         if data.dtype != torch.float32:
@@ -56,6 +59,13 @@ def main():
     print(f"Overall Compression Ratio: {ratio:.2f}")
     print(f"Time to compress params: {t1 - t0:.2f} s")
     print(f"Time to decompress params: {t3 - t2:.2f} s")
+
+    ndata = original_params.cpu().numpy()
+    t4 = time.time()
+    compressed = pyzfp.compress(ndata, tolerance=1e-4)
+    t5 = time.time()
+    print(f"pyzfp Compression Ratio: {original_params.numel() * 4.0 / len(compressed):.2f}")
+    print(f"pyzfp Compression Time: {t5 - t4:.2f} s")
 
 if __name__ == "__main__":
     main()
