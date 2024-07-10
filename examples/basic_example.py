@@ -11,7 +11,7 @@ def main():
     num_floats = 32 * 1024
     original_data = torch.tensor(np.random.normal(mean, std, num_floats), dtype=torch.float32).to(gpu_device)
 
-    print(f"original_data.shape: {original_data.shape}")
+    print(f"original_data = {original_data.shape} {original_data.dtype} {original_data.device}")
     print(f"original_data mean: {original_data.mean().item():.4f}, std: {original_data.std().item():.4f}")
 
     # Compression
@@ -26,6 +26,8 @@ def main():
     t2 = time.time()
     decompressed_data = cuda_float_compress.cuszplus_decompress(compressed_data, gpu_device)
     t3 = time.time()
+
+    print(f"decompressed_data = {decompressed_data.shape} {decompressed_data.dtype} {decompressed_data.device}")
 
     # Calculate statistics
     max_err = torch.max(torch.abs(original_data - decompressed_data))

@@ -37,6 +37,9 @@ After installing the package, you can run the example script (from the root dire
 conda activate cfc
 
 python examples/basic_example.py
+
+# Install torchvision to test the model_compress_example.py script
+pip install torchvision
 python examples/model_compress_example.py
 ```
 
