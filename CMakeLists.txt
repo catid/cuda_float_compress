@@ -84,8 +84,8 @@ if(CMAKE_BUILD_TYPE MATCHES "Debug")
 endif()
 
 pybind11_add_module(cuda_float_compress
-    src/cuda_float_compress.cpp
-    src/cuszplus_f32.cu
+    src/cuda_float_compress/cuda_float_compress.cpp
+    src/cuda_float_compress/cuszplus_f32.cu
 )
 
 target_include_directories(cuda_float_compress PUBLIC
