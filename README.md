@@ -91,7 +91,6 @@ This is the result of running the `examples/model_compress_example.py` script on
   warnings.warn(msg)
 original_params.shape: torch.Size([145046770])
 compressed_params = torch.Size([144257393]) torch.uint8 cpu
-INFO: Decompression completed successfully
 stem.0.weight = torch.Size([32, 3, 3, 3]) torch.float32 cuda:0
     MSE: 3.46646800153394e-09 Max Error: 0.00010001659393310547
 stem.1.weight = torch.Size([32]) torch.float32 cuda:0

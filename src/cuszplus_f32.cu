@@ -658,6 +658,5 @@ bool DecompressFloats(
         return false;
     }
 
-    cerr << "INFO: Decompression completed successfully" << endl;
     return true;
 }
