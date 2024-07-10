@@ -22,6 +22,9 @@ git submodule update --init --recursive
 
 conda create -n cfc python=3.10 -y && conda activate cfc
 
+# Install dependencies.  Right now this is just torch and numpy.
+pip install -r requirements.txt
+
 pip install .
 ```
 
