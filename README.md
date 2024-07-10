@@ -2,7 +2,7 @@
 
 Python package for compressing floating-point PyTorch tensors.  Accepts 1D float32 tensors on CPU or GPU for compression.  Returns 1D float32 tensors on GPU for decompression.  Works best for arrays larger than 32K floats.
 
-Provides a fast (GPU-accelerated) compression algorithm for PyTorch model parameters, gradients, and other data that is transmitted over the network while training machine learning models. 
+Provides a fast (GPU-accelerated) compression algorithm to speed up the transmission of PyTorch model parameters, gradients, and other network data while training machine learning models.
 
 This algorithm has a guaranteed maximum error bound for the decompressed data.
 
