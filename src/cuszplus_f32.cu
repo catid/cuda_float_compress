@@ -395,7 +395,7 @@ __global__ void SZplus_compress(
 
     compressed_words += threadIdx.x * THREAD_GROUP_COUNT;
 
-    // Interleave bits for words from this thread into shared memory
+    // Interleave bits for words from this thread
     #pragma unroll
     for (int i = 0; i < THREAD_GROUP_COUNT; i++) {
         uint32_t shuffled_words[QUANT_GROUP_SIZE];

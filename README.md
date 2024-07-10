@@ -4,7 +4,9 @@ Python package for compressing floating-point PyTorch tensors.  Accepts 1D float
 
 Provides a fast (GPU-accelerated) compression algorithm for PyTorch model parameters, gradients, and other data that is transmitted over the network while training machine learning models. 
 
-This algorithm has a guaranteed maximum error bound for the decompressed data.
+This library has a guaranteed maximum error bound for the decompressed data.
+
+Please read the `src/cuszplus_f32.cu` file for details on the compression algorithm, which is a fairly simple CUDA kernel used to prepare data for further compression on CPU using Zstd's fastest compression mode.
 
 
 ## Installation
