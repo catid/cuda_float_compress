@@ -2,14 +2,18 @@
 
 Python package for compressing floating-point PyTorch tensors.  Accepts 1D float32 tensors on CPU or GPU for compression.  Returns 1D float32 tensors on GPU for decompression.  Works best for arrays larger than 32K floats.
 
-Provides a fast (GPU-accelerated) compression algorithm for PyTorch model parameters, gradients, and other data that is transmitted over the network while training machine learning models. 
+Provides a fast (GPU-accelerated) compression algorithm to speed up the transmission of PyTorch model parameters, gradients, and other network data while training machine learning models.
 
 This library has a guaranteed maximum error bound for the decompressed data.
 
 Please read the `src/cuszplus_f32.cu` file for details on the compression algorithm, which is a fairly simple CUDA kernel used to prepare data for further compression on CPU using Zstd's fastest compression mode.
 
+Released under BSD 3-Clause License for unrestricted use in commercial and open-source software.
+
 
 ## Installation
+
+These instructions require you have installed [Conda](https://docs.anaconda.com/miniconda/miniconda-install/).
 
 ```bash
 git clone https://github.com/catid/cuda_float_compress
@@ -24,7 +28,7 @@ pip install .
 
 ## Testing
 
-After installing the package, you can run the example script:
+After installing the package, you can run the example script (from the root directory of the project).
 
 ```bash
 conda activate cfc
@@ -69,6 +73,10 @@ Time to compress params: 0.40 s
 Time to decompress params: 0.32 s
 ```
 
+Terminology:
+* Max error = Maximum error in `Original_i - Decompressed_i` values.
+* MSE = Mean Squared Error = `Mean{ (Original_i - Decompressed_i)^2 }`
+
 On this 145M parameter model, it achieves a 4:1 compression ratio, matching the performance of 8-bit quantization with guaranteed accuracy of 0.0001 per parameter.
 
 It seems to take about 0.5 seconds per 150M parameters to compress, and a little faster to decompress.
@@ -76,9 +84,14 @@ It seems to take about 0.5 seconds per 150M parameters to compress, and a little
 
 # Discussion
 
-If the data to compress has other features like low-rank structure, then applying SVD to the data before compression can be helpful.  This Python package does not implement SVD, but it is compatible with it.
+If the data to compress has other features like low-rank structure, then applying SVD (Singular Value Decomposition) to the data before compression can be helpful.  An example of using SVD for compression is [here](https://timbaumann.info/svd-image-compression-demo/).  This Python package does not implement SVD, but it is compatible with it.
 
-Some quantization approaches address ( such as the one described in https://arxiv.org/abs/2407.04480 ) accumulate the error in transmitted parameters and add the error back into the next communication round to compensate for the quantization error.  This Python package does not implement this idea, but it is compatible with it.
+Some quantization approaches, such as the one described [here](https://arxiv.org/abs/2407.04480), accumulate the error in transmitted parameters and add the error back into the next communication round to compensate for the quantization error.  This Python package does not implement this idea, but it is compatible with it.
+
+
+# Limitations and Future Work
+
+Currently it only works for float32 tensors.  I'd like to add support for FP16 once I start actually using this in my training scripts.  Also it would make sense to add functionality to compress PyTorch model parameters of other types too like UINT64.  For more general use-cases it would make sense to add a CPU version of the algorithm (one is provided in the `cpu_compress_test/` folder).
 
 
 # Credits
