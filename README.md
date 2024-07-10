@@ -11,7 +11,42 @@ Please read the `src/cuszplus_f32.cu` file for details on the compression algori
 Released under BSD 3-Clause License for unrestricted use in commercial and open-source software.
 
 
-## Installation
+## Basic Example
+
+Add the `cuda_float_compress` package to your Python environment.
+
+```bash
+# Install the `cuda_float_compress` package from PyPI
+pip install -U cuda_float_compress
+```
+
+Then you can use it like this in your Python code:
+
+```python
+import torch
+import cuda_float_compress
+import numpy as np
+
+gpu_device = torch.device("cuda:0")
+
+# Generate some random data
+mean = 0
+std = 1
+num_floats = 32 * 1024
+original_data = torch.tensor(np.random.normal(mean, std, num_floats), dtype=torch.float32).to(gpu_device)
+
+# Compress the data, specifying the maximum error bound
+error_bound = 0.0001
+compressed_data = cuda_float_compress.cuszplus_compress(original_data, error_bound)
+
+# --- Send the data over the network here ---
+
+# Decompress the data
+decompressed_data = cuda_float_compress.cuszplus_decompress(compressed_data, gpu_device)
+```
+
+
+## Manual Installation
 
 These instructions require you have installed [Conda](https://docs.anaconda.com/miniconda/miniconda-install/).
 

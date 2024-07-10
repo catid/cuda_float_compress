@@ -1,4 +1,4 @@
 include CMakeLists.txt
-include src *
+recursive-include src *
 recursive-include pybind11 *
 recursive-include zstd *
