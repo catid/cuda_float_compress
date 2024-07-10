@@ -120,7 +120,7 @@ Terminology:
 
 On this 145M parameter model, it achieves a 4:1 compression ratio, matching the performance of 8-bit quantization with guaranteed accuracy of 0.0001 per parameter.
 
-It seems to take about 0.5 seconds per 150M parameters to compress, and a little faster to decompress.
+It seems to take about 0.5 seconds per 150M parameters to compress, and a little faster to decompress.  So about 1.5GBPS.
 
 
 # Discussion
@@ -131,6 +131,8 @@ Some quantization approaches, such as the one described [here](https://arxiv.org
 
 
 # Limitations and Future Work
+
+If your network link is faster than 10Gbps, then it may not be an improvement over just sending the file uncompressed since it compresses at about 12 Gbps.  So, it's well-suited for most kinds of Internet transfers, but maybe less useful to send data between servers that are connected via 100G+ InfiniBand or some other supercomputer-class switched network.  I'm personally planning to use this for distributed training on the Internet, so it's a better option for me than a faster CUDA-only approach that gets a worse compression ratio.
 
 Currently it only works for float32 tensors.  I'd like to add support for FP16 once I start actually using this in my training scripts.  Also it would make sense to add functionality to compress PyTorch model parameters of other types too like UINT64.  For more general use-cases it would make sense to add a CPU version of the algorithm (one is provided in the `cpu_compress_test/` folder).
 
