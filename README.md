@@ -13,7 +13,7 @@ Released under BSD 3-Clause License for unrestricted use in commercial and open-
 
 ## Prerequisites
 
-This requires [CUDA Toolit](https://developer.nvidia.com/cuda-downloads) and CMake.  On Ubuntu you can install them with:
+This requires [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) and CMake.  On Ubuntu you can install them with:
 
 ```bash
 sudo apt install cuda cuda-toolkit cmake build-essential
