@@ -38,7 +38,7 @@ class BuildPackage(build_ext):
 
 setup(
     name='cuda_float_compress',
-    version='0.2.2',
+    version='0.2.3',
     python_requires='>=3.7',
     author='catid',
     description='A PyTorch CUDA extension for floating-point compression',
