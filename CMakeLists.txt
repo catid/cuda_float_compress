@@ -63,7 +63,9 @@ add_subdirectory(pybind11)
 
 set(ZSTD_BUILD_PROGRAMS OFF)
 set(ZSTD_BUILD_TESTS OFF)
-add_subdirectory(zstd/build/cmake)
+set(ZSTD_BUILD_STATIC ON)
+set(ZSTD_BUILD_SHARED OFF)
+add_subdirectory(zstd/build/cmake EXCLUDE_FROM_ALL)
 
 # Configure CUDA after finding Torch to avoid conflicts
 find_package(CUDAToolkit REQUIRED)

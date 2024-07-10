@@ -46,7 +46,7 @@ setup(
     ext_modules=[CMakeExtension('cuda_float_compress')],
     cmdclass={"build_ext": BuildPackage},
     package_data={
-        'cuda_float_compress': ['*.so'],
+        'cuda_float_compress': ['cuda_float_compress*.so'],
     },
     include_package_data=True,
 
