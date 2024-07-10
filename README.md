@@ -53,30 +53,29 @@ Then you can use this minimal example to verify that it works (available in `exa
 
 ```python
 import torch
-import cuda_float_compress
 import numpy as np
+import cuda_float_compress
 
-gpu_device = torch.device("cuda:0")
+cuda_device = torch.device("cuda")
 
 # Generate some random data
-mean = 0
-std = 1
-num_floats = 32 * 1024
-original_data = torch.tensor(np.random.normal(mean, std, num_floats), dtype=torch.float32).to(gpu_device)
+original_data = torch.tensor(np.random.normal(0, 1, 32 * 1024), dtype=torch.float32, device=cuda_device)
 
 # Compress the data, specifying the maximum error bound
-error_bound = 0.0001
-compressed_data = cuda_float_compress.cuszplus_compress(original_data, error_bound)
+max_error = 0.0001
+compressed_data = cuda_float_compress.cuszplus_compress(original_data, max_error)
 
 # --- Send the data over the network here ---
 
 # Decompress the data
-decompressed_data = cuda_float_compress.cuszplus_decompress(compressed_data, gpu_device)
+decompressed_data = cuda_float_compress.cuszplus_decompress(compressed_data, cuda_device)
 
 # Verify that the decompressed data is the same as the original data
-assert torch.allclose(original_data, decompressed_data, atol=error_bound)
+assert torch.allclose(original_data, decompressed_data, atol=max_error)
 print(f"Works! Compression Ratio: {original_data.numel() * 4.0 / compressed_data.numel():.2f}")
 ```
+
+This requires that you pip install `torch` and `numpy` first.
 
 
 ## Manual Installation
