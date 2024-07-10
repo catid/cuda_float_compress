@@ -138,3 +138,7 @@ Currently it only works for float32 tensors.  I'd like to add support for FP16 o
 # Credits
 
 I was inspired to work on this project by trying to fix bugs in the [cuSZp](https://github.com/szcompressor/cuSZp) project to use it for distributed ML training.  Thanks for sharing your work!
+
+Based on the Facebook Zstd project: https://github.com/facebook/zstd
+
+Uses pybind11 for PyTorch tensor features: https://github.com/pybind/pybind11
