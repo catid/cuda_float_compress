@@ -173,7 +173,7 @@ If your network link is faster than 10Gbps, then it may not be an improvement ov
 Currently it only works for float32 tensors.  I'd like to add support for FP16 once I start actually using this in my training scripts.  Also it would make sense to add functionality to compress PyTorch model parameters of other types too like UINT64.  For more general use-cases it would make sense to add a CPU version of the algorithm (one is provided in the `cpu_compress_test/` folder).
 
 
-# Credits
+# Acknowledgements
 
 I was inspired to work on this project by trying to fix bugs in the [cuSZp](https://github.com/szcompressor/cuSZp) project to use it for distributed ML training.  Thanks for sharing your work!
 
